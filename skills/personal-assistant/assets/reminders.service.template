@@ -1,0 +1,13 @@
+[Unit]
+Description=Due-only personal assistant reminders
+After=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/usr/bin/python3 /INSTALLED_SKILL/scripts/reminder_tools.py --config /PRIVATE_USER_STATE/reminder-host.json serve
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

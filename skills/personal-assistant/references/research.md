@@ -1,0 +1,17 @@
+# Primary-source comparison, 2026-10-08
+
+Research informed design; no third-party skill was installed or copied. Live surfaces/versions must be verified separately during host activation.
+
+| Source | Relevant behavior | Reuse / omit |
+| --- | --- | --- |
+| [OpenAI skill authoring](https://learn.chatgpt.com/docs/build-skills) | Named/described SKILL.md plus optional scripts/references; progressive loading and implicit discovery | Reuse native format and supported local initializer/validator; keep runtime identity/config outside package |
+| [Anthropic task-management skill](https://github.com/anthropics/knowledge-work-plugins/blob/main/productivity/skills/task-management/SKILL.md) | Markdown task intake, completion and waiting-on summaries; “remind me” records a static task | Reuse concise intake/summary concept. Omit dashboard/bootstrap assumptions and static-task substitute for actual timed delivery |
+| [Anthropic memory-management skill](https://github.com/anthropics/knowledge-work-plugins/blob/main/productivity/skills/memory-management/SKILL.md) | Tiered context/glossary retrieval for shorthand and forgotten context | Reuse targeted lookup before asking again. Omit broad personal-history/people-profile ingestion into shared memory |
+| [Taskwarrior task manual](https://taskwarrior.org/docs/man/task.1/) | Explicit depends relationships and blocked reporting | Reuse explicit graph semantics. Omit new Taskwarrior dependency/store because current local assistant needs a small source graph, not another account/tool stack |
+| [Python zoneinfo](https://docs.python.org/3/library/zoneinfo.html) | IANA zones and fold for repeated local times | Reuse stdlib zone data and round-trip DST validation; do not guess ambiguous times |
+| [systemd timer upstream manual](https://github.com/systemd/systemd/blob/main/man/systemd.timer.xml) | Calendar timers support catch-up; timing accuracy and sleep/wake behavior have limits | Consider deterministic timers/service supervision; don't equate timer execution with message receipt |
+| [Telegram Bot API](https://core.telegram.org/bots/api) | Chat-targeted sends and chat identity API | Reference only. Reuse existing Ours connector, never direct custom Bot API transport |
+
+For this assignment, the current Fleet periodic model loop is disabled by Owner instruction and remains disabled. Cron invoking an LLM periodically is also excluded. Cron invoking only a deterministic helper could avoid empty model turns, but minute granularity and mutable reminder management still need durable state and delivery reconciliation. Calendar timer units support catch-up but a unit per reminder adds update/cancel coordination. Chosen pair design is one durable SQLite reminder store and one systemd-supervised deterministic waiting service; clock/state checks are local and only actual due reminders submit authenticated contextual model events. This choice is project reasoning, not a claim established by third-party docs.
+
+The skill handles source tasks/events and curated preferences; Developer2 runtime owns schedules/admissions/delivery, supported Fleet control and Ours Telegram capabilities. The package contains no bot token, user CID, list ID, personal state or private absolute workspace. Official authoring currently documents `.agents/skills`; task default requests `.codex/skills`, so discovery must be checked against the installed Codex version rather than inferred from current documentation alone.

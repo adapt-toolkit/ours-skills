@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "assistant_identity": null,
+  "list_id": null,
+  "timezone": null,
+  "source_db": "source.sqlite3",
+  "preferences": "preferences.json",
+  "event_reminder_map": "event-reminders.json",
+  "reminder_runtime_config": null,
+  "reminder_runtime_entrypoint": null,
+  "approved_ours_contact": null,
+  "telegram_verified": false,
+  "periodic_model_polling": false,
+  "runtime_enabled": false,
+  "source_schema": 2
+}

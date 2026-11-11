@@ -1,0 +1,17 @@
+{
+  "database": "/PRIVATE_USER_STATE/reminders.sqlite",
+  "agent": "PERMANENT_ASSISTANT_NAME",
+  "expected_agent_cid": "VERIFIED_PERMANENT_ASSISTANT_CID",
+  "agent_state_dir": "/PRIVATE_FLEET_STATE/agents/PERMANENT_ASSISTANT_NAME",
+  "fleet_control_module": "/INSTALLED_FLEET/dist/session/control.js",
+  "fleet_cli": "/INSTALLED_FLEET_CLI",
+  "route": {
+    "channel": "ours",
+    "contact_cid": "VERIFIED_OWNER_OR_TELEGRAM_ROUTE_CID",
+    "verified": false
+  },
+  "source_db": "/PRIVATE_USER_STATE/source.sqlite3",
+  "source_schema": 2,
+  "source_namespace": "REPLACE_WITH_PRIVATE_CANONICAL_UUID",
+  "source_journal": "/PRIVATE_USER_STATE/source.operations.sqlite"
+}
