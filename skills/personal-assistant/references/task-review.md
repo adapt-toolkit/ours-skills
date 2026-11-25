@@ -60,7 +60,9 @@ fixed-interval reminder loop, inbox polling or any other periodic model work.
    - confirmed quiet hours, the per-task cooldown and budget;
    - at most 3 claims per 2h across tasks, and no other claim in flight;
    - for `hh-` tasks, the role's own household `bind_reminder` + `due_guard`,
-     re-reading source after the guard.
+     re-reading source after the guard. The binding id is the namespaced
+     `task-review:<attempt_id>`, so it never replaces an existing timer's
+     household binding. Closed, stale and conflicted peer items are refused.
 
    Send only on `send: true`, through the normal configured route. Then call
    `send_result` with `sent` (+`wire_id`), `failed`, `not_sent` or
@@ -78,9 +80,13 @@ fixed-interval reminder loop, inbox polling or any other periodic model work.
   the unanswered count when the user actually engaged with the task after the
   last review message. Each wire counts once; older or replayed messages never
   reset a later budget.
-- `uncertain` keeps the claim in flight and the task held. Check your own
-  outbound history, then `send_result` `sent` or `not_sent`. Never resend
-  blindly. Replaying `begin_send` with a used `attempt_id` never authorizes a
+- The send time recorded is the transport confirmation time, a conservative
+  bound that is never earlier than the real send.
+- `uncertain` keeps the claim in flight and the task held. Resolve it with
+  `sent` (+`wire_id`) when history shows the message. Resolve it with
+  `not_sent`/`failed` only when there is definite evidence: `evidence` set to
+  `transport_rejected` or `never_submitted`. Absence from history alone keeps
+  it held. Never resend blindly. Replaying `begin_send` with a used `attempt_id` never authorizes a
   second send.
 - Opt-out: when the user asks not to be asked about a task, `record` `opt_out`;
   `opt_in` reverses it. Completion, cancellation or archive in source stops
@@ -97,16 +103,28 @@ fixed-interval reminder loop, inbox polling or any other periodic model work.
 Existing mechanisms keep their purpose and hold the task while they are live,
 so review never creates a second channel for the same purpose:
 
-- legacy source-bound reminders: an active mapping verified as active and
-  unexpired, or as still in delivery, in the read-only delivery ledger. A
-  naturally finished reminder no longer holds the task;
+- legacy source-bound reminders: an active mapping checked against the
+  read-only delivery ledger, across the reminder and its follow-ups. It holds
+  while that reminder is active and unexpired, or while any event is still
+  admitted or in delivery (`pending`/`submitting`/`queued`/`uncertain`, or
+  `delivery_status` `sending`/`uncertain`). A naturally finished reminder no
+  longer holds the task;
 - active message-return rules and contextual return decisions until their
   deadline;
 - a prepared task-trigger reservation;
+- a source schedule operation still `prepared` (not yet mapped);
 - a native self-reminder registered with `cover`, which takes the actual
   receipt: `reminder_id`, `revision`, `due_at`, `expires_at`. The hold lasts
-  until its late-window expiry. Update it when the reminder changes and
-  `cover` `clear` it when that reminder is cancelled or handled.
+  until its late-window expiry. Cover is compare-and-swap:
+  - re-register a newer revision of the same reminder to update it;
+  - replacing it with a different reminder needs `replaces: "<id>@<revision>"`;
+  - `clear` needs the covering id and revision;
+  - stale or other receipts are refused.
+
+At activation, register each existing native reminder that is bound to a task.
+
+Legacy lookups fail closed: an unrecognized ledger schema or a query error
+stops the pass instead of reading as "no timer".
 
 When the mechanism ends, the task returns to normal review. Household items
 remain governed by their peer protocol: stale, conflicted or closed items fail

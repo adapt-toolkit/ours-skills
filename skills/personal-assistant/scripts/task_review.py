@@ -162,36 +162,61 @@ def open_tasks(src):
     return {r['id']: r for r in rows}
 
 
-def _rows(db, sql, args):
-    try:
-        return db.execute(sql, args).fetchall()
-    except sqlite3.Error:  # optional extension table absent in this installation
+def _has_table(db, name):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _rows(db, table, sql, args):
+    """An absent optional extension table means 'no such mechanism'. Any other failure
+    propagates (fail closed) instead of being read as absence."""
+    if not _has_table(db, table):
         return []
+    return db.execute(sql, args).fetchall()
+
+
+# Real legacy ledger semantics: event admission `status` and transport `delivery_status` are
+# separate; follow-up children extend the lineage of the mapped reminder.
+LEDGER_LIVE = """WITH RECURSIVE lineage(id) AS (
+  SELECT ? UNION SELECT f.child_id FROM lineage l JOIN events e ON e.reminder_id=l.id
+  JOIN followups f ON f.parent_event_id=e.event_id)
+SELECT
+ (SELECT MAX(r.expires) FROM reminders r JOIN lineage l ON r.id=l.id WHERE r.status='active') AS active_until,
+ EXISTS(SELECT 1 FROM events e JOIN lineage l ON e.reminder_id=l.id
+        WHERE e.delivery_status IN ('sending','uncertain')
+           OR (e.delivery_status IS NULL AND e.status IN ('pending','submitting','queued','uncertain'))) AS in_delivery"""
 
 
 def existing_mechanism(src, ledger, task_id, at):
     """(kind, until) when an existing timer/return already owns this task's next return.
-    Legacy mappings are verified against the delivery ledger, so a naturally finished
-    reminder whose source mapping still reads 'active' does not suppress the task forever."""
+    Legacy mappings are verified against the delivery ledger, so a naturally finished reminder
+    does not suppress the task forever, while any queued/sending/uncertain delivery still holds it."""
     ref = 'task:' + task_id
-    for m in _rows(src, "SELECT reminder_id FROM reminder_mappings WHERE source_ref=? AND status='active'", (ref,)):
+    if _rows(src, 'source_schedule_operations',
+             "SELECT 1 FROM source_schedule_operations WHERE source_ref=? AND status='prepared' LIMIT 1", (ref,)):
+        return 'pending_schedule_operation', None
+    for m in _rows(src, 'reminder_mappings',
+                   "SELECT reminder_id FROM reminder_mappings WHERE source_ref=? AND status='active'", (ref,)):
         if ledger is None:
             return 'legacy_timer_unverified', None
-        if _rows(ledger, "SELECT 1 FROM events WHERE reminder_id=? AND status IN ('pending','sending','submitting','uncertain')",
-                 (m['reminder_id'],)):
+        if not all(_has_table(ledger, t) for t in ('reminders', 'events', 'followups')):
+            raise ValueError('configured delivery ledger has an unrecognized schema')
+        live = ledger.execute(LEDGER_LIVE, (m['reminder_id'],)).fetchone()
+        if live['in_delivery']:
             return 'legacy_timer_in_delivery', None
-        r = _rows(ledger, 'SELECT status,expires FROM reminders WHERE id=?', (m['reminder_id'],))
-        if r and r[0]['status'] == 'active' and when(r[0]['expires']) > at:
-            return 'legacy_timer', when(r[0]['expires'])
-    for r in _rows(src, 'SELECT deadline FROM note_rules WHERE source_ref=? AND active=1 AND remaining>0 '
-                        'AND invalidated_by IS NULL', (ref,)):
+        if live['active_until'] is not None and when(live['active_until']) > at:
+            return 'legacy_timer', when(live['active_until'])
+    for r in _rows(src, 'note_rules', 'SELECT deadline FROM note_rules WHERE source_ref=? AND active=1 '
+                   'AND remaining>0 AND invalidated_by IS NULL', (ref,)):
         if when(r['deadline']) > at:
             return 'message_return_rule', when(r['deadline'])
-    for r in _rows(src, "SELECT deadline FROM return_decisions WHERE source_ref=? "
-                        "AND decision IN ('planned_timed','planned_message','committed_message')", (ref,)):
-        if r['deadline'] and when(r['deadline']) > at:
+    for r in _rows(src, 'return_decisions', "SELECT deadline FROM return_decisions WHERE source_ref=? "
+                   "AND decision IN ('planned_timed','planned_message','committed_message')", (ref,)):
+        if r['deadline'] is None:
+            return 'contextual_return', None
+        if when(r['deadline']) > at:
             return 'contextual_return', when(r['deadline'])
-    if _rows(src, "SELECT 1 FROM task_trigger_reservations WHERE task_id=? AND status='prepared'", (task_id,)):
+    if _rows(src, 'task_trigger_reservations',
+             "SELECT 1 FROM task_trigger_reservations WHERE task_id=? AND status='prepared'", (task_id,)):
         return 'task_trigger_pending', None
     return None, None
 
@@ -432,7 +457,7 @@ def begin_send(review, src, data, at, cfg=None, ledger=None):
 
 def send_result(review, data, at, cfg=None):
     """Record the ACTUAL transport outcome of a claimed attempt. `uncertain` keeps it held."""
-    if set(data) - {'attempt_id', 'outcome', 'wire_id'} or not {'attempt_id', 'outcome'} <= set(data):
+    if set(data) - {'attempt_id', 'outcome', 'wire_id', 'evidence'} or not {'attempt_id', 'outcome'} <= set(data):
         raise ValueError('attempt_id and outcome required')
     outcome = data['outcome']
     if outcome not in SEND_OUTCOMES:
@@ -454,11 +479,15 @@ def send_result(review, data, at, cfg=None):
                            (row['task_id'],))
             return {'status': 'held_uncertain', 'attempt_id': claim['attempt_id'],
                     'action': 'check your own outbound history, then send_result sent(+wire_id) or not_sent'}
+        if claim['state'] == 'uncertain' and outcome in ('failed', 'not_sent'):
+            # Absence from history is not proof of non-delivery: require a definite transport result.
+            if data.get('evidence') not in ('transport_rejected', 'never_submitted'):
+                raise ValueError('uncertain send stays held without definite evidence (transport_rejected|never_submitted)')
         wire = text(data.get('wire_id'), 256) if outcome == 'sent' else None
         review.execute('UPDATE send_claims SET state=?,wire_id=?,closed_utc=? WHERE attempt_id=?',
                        (outcome, wire, iso(at), claim['attempt_id']))
         if outcome == 'sent':
-            sent_at = parse(claim['claimed_utc'])
+            sent_at = at  # transport confirmation time: a conservative bound, never before the actual send
             n = row['unanswered_sends'] + 1
             reason = 'awaiting_response' if n < MAX_UNANSWERED else 'repeat_budget_exhausted'
             review.execute('''UPDATE task_reviews SET last_review_utc=?,last_outcome='sent',last_send_utc=?,last_send_wire=?,
@@ -494,28 +523,44 @@ def responded(review, data, at, cfg=None):
     return {'status': 'recorded', 'task_id': row['task_id']}
 
 
-def cover(review, data, at, cfg=None):
-    """Register an ACTUAL native self-reminder receipt that already owns this task's next return.
-    Coverage lasts until its late-window expiry; update it when the reminder changes and clear it
-    when that reminder is cancelled or handled."""
-    if data.get('clear') is True:
-        if set(data) != {'task_id', 'clear'}:
-            raise ValueError('task_id and clear:true only')
-        with source.atomic(review, True):
-            row = _task_row(review, data['task_id'])
-            review.execute('UPDATE task_reviews SET covered_by=NULL,covered_until_utc=NULL WHERE task_id=?', (row['task_id'],))
-        return {'status': 'cleared', 'task_id': row['task_id']}
-    if set(data) != {'task_id', 'reminder_id', 'revision', 'due_at', 'expires_at'}:
-        raise ValueError('task_id plus the actual reminder id, revision, due_at and expires_at required')
-    if type(data['revision']) is not int or data['revision'] < 1:
+def _cover_ref(data):
+    if type(data.get('revision')) is not int or data['revision'] < 1:
         raise ValueError('positive reminder revision required')
-    due, expires = when(text(data['due_at'], 64)), when(text(data['expires_at'], 64))
-    if not due <= expires or expires <= at or expires > at + timedelta(days=1840):
-        raise ValueError('current reminder receipt required')
+    return text(data.get('reminder_id'), 128), data['revision']
+
+
+def cover(review, data, at, cfg=None):
+    """Register / update / clear the ACTUAL native self-reminder receipt that owns this task's next
+    return. Compare-and-swap on the stored receipt: a stale or different receipt can never erase or
+    replace a live hold. Coverage lasts until that reminder's late-window expiry."""
     with source.atomic(review, True):
-        row = _task_row(review, data['task_id'])
+        row = _task_row(review, data.get('task_id'))
+        live = row['covered_by'] if row['covered_until_utc'] and parse(row['covered_until_utc']) > at else None
+        cur = None if live is None else (live.rsplit('@', 1)[0], int(live.rsplit('@', 1)[1]))
+        if data.get('clear') is True:
+            if set(data) != {'task_id', 'clear', 'reminder_id', 'revision'}:
+                raise ValueError('task_id, clear:true and the covering reminder_id/revision required')
+            rid, rev = _cover_ref(data)
+            if cur is None:
+                return {'status': 'nothing_to_clear', 'task_id': row['task_id']}
+            if cur[0] != rid or rev < cur[1]:
+                raise ValueError('stale or different reminder receipt; live hold kept')
+            review.execute('UPDATE task_reviews SET covered_by=NULL,covered_until_utc=NULL WHERE task_id=?', (row['task_id'],))
+            return {'status': 'cleared', 'task_id': row['task_id']}
+        if set(data) - {'task_id', 'reminder_id', 'revision', 'due_at', 'expires_at', 'replaces'} or \
+                not {'task_id', 'reminder_id', 'revision', 'due_at', 'expires_at'} <= set(data):
+            raise ValueError('task_id plus the actual reminder id, revision, due_at and expires_at required')
+        rid, rev = _cover_ref(data)
+        due, expires = when(text(data['due_at'], 64)), when(text(data['expires_at'], 64))
+        if not due <= expires or expires <= at or expires > at + timedelta(days=1840):
+            raise ValueError('current reminder receipt required')
+        if cur is not None:
+            if cur[0] == rid and rev < cur[1]:
+                raise ValueError('stale reminder revision; live hold kept')
+            if cur[0] != rid and data.get('replaces') != '%s@%d' % cur:
+                raise ValueError('another reminder holds this task; pass replaces=<id@revision> after reconciling it')
         review.execute('UPDATE task_reviews SET covered_by=?,covered_until_utc=? WHERE task_id=?',
-                       ('%s@%d' % (text(data['reminder_id'], 128), data['revision']), iso(expires), row['task_id']))
+                       ('%s@%d' % (rid, rev), iso(expires), row['task_id']))
     return {'status': 'covered', 'task_id': row['task_id'], 'until_utc': iso(expires)}
 
 

@@ -286,35 +286,88 @@ class TaskReviewTest(unittest.TestCase):
         self.assertIsNone(u.task('hh-item1', self.t0)['in_flight_attempt'])
 
     def test_existing_timers_and_returns_are_reconciled_not_duplicated(self):
+        import reminder_tools
         u = self.u
-        for t in ('native', 'legacy', 'legacy-done', 'rule'):
+        ids = ('native', 'legacy', 'legacy-done', 'legacy-uncertain', 'legacy-queued', 'journal', 'rule')
+        for t in ids:
             u.put(t)
         u.plan(self.t0)
         exp = self.t0 + timedelta(days=3, hours=1)
         u.call('cover', self.t0, task_id='native', reminder_id='rem-x', revision=2,
                due_at=tr.iso(self.t0 + timedelta(days=3)), expires_at=tr.iso(exp))
-        # legacy mapping verified against a synthetic delivery ledger
+        # real legacy ledger schema; admission status and delivery_status are separate
         u.ledger = sqlite3.connect(':memory:'); u.ledger.row_factory = sqlite3.Row
-        u.ledger.executescript('CREATE TABLE reminders(id TEXT,status TEXT,expires REAL);'
-                               'CREATE TABLE events(reminder_id TEXT,status TEXT);')
-        u.ledger.execute('INSERT INTO reminders VALUES (?,?,?)', ('L1', 'active', (self.t0 + timedelta(days=2)).timestamp()))
-        u.ledger.execute('INSERT INTO reminders VALUES (?,?,?)', ('L2', 'expired', (self.t0 - timedelta(days=2)).timestamp()))
-        for i, (rid, ref) in enumerate((('L1', 'task:legacy'), ('L2', 'task:legacy-done'))):
+        u.ledger.executescript(reminder_tools.SCHEMA)
+        past, future = (self.t0 - timedelta(days=2)).timestamp(), (self.t0 + timedelta(days=2)).timestamp()
+        def legacy(rid, ref, status, expires, event=None):
+            u.ledger.execute('INSERT INTO reminders VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                             (rid, 1, 'x', 'x', ref, '2027-01-01T00:00', ZONE, None, expires - 3600, expires, status))
+            if event:
+                u.ledger.execute('INSERT INTO events(event_id,reminder_id,revision,status,delivery_status) VALUES (?,?,?,?,?)',
+                                 ('e-' + rid, rid, 1) + event)
             u.src.execute('INSERT INTO source_schedule_operations VALUES (?,?,?,?,?,?,?,?)',
-                          ('op%d' % i, 'd', ref, 1, 'd', '{}', 'mapped', 'r'))
-            u.src.execute('INSERT INTO reminder_mappings VALUES (?,?,?,?,?,?,?)', (rid, ref, 1, 'd', 1, 'active', 'op%d' % i))
+                          ('op-' + rid, 'd', ref, 1, 'd', '{}', 'mapped', 'r'))
+            u.src.execute('INSERT INTO reminder_mappings VALUES (?,?,?,?,?,?,?)', (rid, ref, 1, 'd', 1, 'active', 'op-' + rid))
+        legacy('L1', 'task:legacy', 'active', future)
+        legacy('L2', 'task:legacy-done', 'expired', past, ('expired', 'transport_confirmed'))
+        legacy('L3', 'task:legacy-uncertain', 'expired', past, ('queued', 'uncertain'))
+        legacy('L4', 'task:legacy-queued', 'expired', past, ('queued', None))
+        u.src.execute('INSERT INTO source_schedule_operations VALUES (?,?,?,?,?,?,?,?)',
+                      ('op-j', 'd', 'task:journal', 1, 'd', '{}', 'prepared', None))
         u.src.execute('CREATE TABLE note_rules(source_ref TEXT,active INT,remaining INT,invalidated_by TEXT,deadline TEXT)')
         u.src.execute('INSERT INTO note_rules VALUES (?,?,?,?,?)', ('task:rule', 1, 2, None, tr.iso(self.t0 + timedelta(days=1))))
         at = self.t0 + PASS
         p = u.plan(at)
         held = {h['id']: h['reason'] for h in p['held']}
         self.assertEqual(held, {'native': 'covered_by_native_timer', 'legacy': 'covered_by_legacy_timer',
+                                'legacy-uncertain': 'covered_by_legacy_timer_in_delivery',
+                                'legacy-queued': 'covered_by_legacy_timer_in_delivery',
+                                'journal': 'covered_by_pending_schedule_operation',
                                 'rule': 'covered_by_message_return_rule'})
-        self.assertIn('legacy-done', {e['id'] for e in p['eligible']})   # finished timer: not stranded
+        self.assertEqual({e['id'] for e in p['eligible']}, {'legacy-done'})   # finished timer: not stranded
         later = self.t0 + timedelta(days=4)
         self.assertEqual(set(u.eligible(later)), {'native', 'legacy', 'legacy-done', 'rule'})
         gen = source.meta(u.src, 'generation'); u.plan(later)
-        self.assertEqual(source.meta(u.src, 'generation'), gen)          # source never written
+        self.assertEqual(source.meta(u.src, 'generation'), gen)              # source never written
+        # unrecognized ledger schema fails closed instead of reading as 'no timer'
+        u.ledger = sqlite3.connect(':memory:'); u.ledger.row_factory = sqlite3.Row
+        u.ledger.execute('CREATE TABLE reminders(id TEXT)')
+        with self.assertRaisesRegex(ValueError, 'unrecognized'):
+            u.plan(at)
+
+    def test_native_cover_compare_and_swap(self):
+        u = self.u; u.put('n'); u.plan(self.t0)
+        due, exp = tr.iso(self.t0 + timedelta(days=1)), tr.iso(self.t0 + timedelta(days=1, hours=1))
+        u.call('cover', self.t0, task_id='n', reminder_id='r1', revision=2, due_at=due, expires_at=exp)
+        with self.assertRaisesRegex(ValueError, 'stale'):        # replay of revision 1 cannot overwrite revision 2
+            u.call('cover', self.t0, task_id='n', reminder_id='r1', revision=1, due_at=due, expires_at=exp)
+        with self.assertRaisesRegex(ValueError, 'another reminder'):
+            u.call('cover', self.t0, task_id='n', reminder_id='r9', revision=1, due_at=due, expires_at=exp)
+        with self.assertRaisesRegex(ValueError, 'stale or different'):
+            u.call('cover', self.t0, task_id='n', clear=True, reminder_id='r9', revision=5)
+        with self.assertRaisesRegex(ValueError, 'stale or different'):
+            u.call('cover', self.t0, task_id='n', clear=True, reminder_id='r1', revision=1)
+        self.assertEqual(u.task('n', self.t0)['covered_by'], 'r1@2')
+        self.assertEqual(u.call('cover', self.t0, task_id='n', clear=True, reminder_id='r1', revision=2)['status'], 'cleared')
+
+    def test_send_time_is_confirmation_time_and_uncertain_needs_evidence(self):
+        u = self.u; u.put('t1')
+        e = u.eligible(self.t0)['t1']
+        u.claim('t1', self.t0, 's1', e)
+        reply_between = self.t0 + timedelta(minutes=1)
+        confirmed = self.t0 + timedelta(minutes=2)
+        u.call('send_result', confirmed, attempt_id='s1', outcome='sent', wire_id='w-s1')
+        self.assertEqual(u.task('t1', confirmed)['last_send_utc'], tr.iso(confirmed))
+        self.assertEqual(u.call('responded', confirmed, task_id='t1', wire_id='in-1', incoming_utc=tr.iso(reply_between))['status'],
+                         'recorded_no_reset')
+        at = self.t0 + timedelta(days=2)
+        e = u.eligible(at)['t1']
+        u.claim('t1', at, 's2', e)
+        u.call('send_result', at, attempt_id='s2', outcome='uncertain')
+        with self.assertRaisesRegex(ValueError, 'definite evidence'):
+            u.call('send_result', at, attempt_id='s2', outcome='not_sent')
+        u.call('send_result', at, attempt_id='s2', outcome='not_sent', evidence='transport_rejected')
+        self.assertIsNone(u.task('t1', at)['in_flight_attempt'])
 
     def test_two_private_users_isolated(self):
         a = self.u
