@@ -48,7 +48,10 @@ The script never sends anything.
 2. `plan`. **Apply its `schedule` first** (create/update/cancel the one chain
    reminder). Then record the receipt with `chain` (`reminder_id`, `revision`,
    `request_key`, `due_at`), or with `{"cancelled": true}` after a cancel. This
-   keeps the chain alive even if the rest of the turn fails.
+   keeps the chain alive even if the rest of the turn fails. `plan` durably
+   records the create intent before you call Fleet. Until the receipt is
+   recorded, it repeats the identical request (same key and input), so a lost
+   receipt never creates a duplicate reminder.
 3. For each `eligible` task, recover bounded current context through the
    ordinary source interface. Compare it with what was last said
    (`last_send_utc`, `unanswered_sends`, `last_outcome`) and with recent
@@ -72,12 +75,15 @@ The script never sends anything.
 ## Send policy
 
 - After a sent review message the task's sends back off: 1d, then 2d, then 4d.
-  After 3 unanswered sends it only gets slow reconsideration (14d). It is
-  never terminal, because silence is not completion. A source edit or a peer
-  projection brings the *review* forward but never shortens the send cooldown
-  or restores budget.
+  After 3 unanswered sends, no further review message is allowed while the
+  task is unchanged. It is still reconsidered every 14 days, because silence
+  is not completion, but each review can only conclude `no_message`. A
+  meaningful change re-allows ONE send: a new source revision or a change in
+  prerequisite readiness after the last send. A source edit or peer projection
+  brings the *review* forward but never shortens the send cooldown.
 - `responded` (`task_id`, actual incoming `wire_id`) clears the unanswered
-  count when the user actually engaged with the task.
+  count when the user actually engaged with the task. Each wire counts once,
+  and replaying it never resets a later budget.
 - `uncertain` keeps the claim in flight and the task held. Check your own
   outbound history, then `send_result` `sent` or `not_sent`. Never resend
   blindly. `begin_send` with an already used `attempt_id` never authorizes a
@@ -129,17 +135,27 @@ installing these instructions:
 3. Run `task_review.py --config <cfg> --init` once.
 4. On the assistant's next turn, run `plan` and create the first chain
    reminder.
+5. The coordinator adds the daily backstop loop described above.
 
-Rollback: remove the config key and cancel the chain reminder. The sidecar is
-then inert; the source and ledgers were never touched.
+Rollback: remove the config key, cancel the chain reminder and disable the backstop loop.
+The sidecar is then inert; the source and ledgers were never touched.
 
-## Chain recovery
+## Chain recovery (autonomous backstop)
 
-The successor reminder is created before any review work, so a failed review
-turn does not break the chain. If a turn fails between the wake and that
-create, or a wake expired during an outage longer than 7 days, `status` shows
-the chain as missing or past. On the next ordinary user-message turn, if the
-chain was not yet seen current this session, run `status`. If open tasks exist
-and the chain is missing or past, run `plan` and apply its `schedule`. A daily
-review via a manifest loop is an optional operator decision and is not part of
-this mechanism.
+A one-shot chain alone can be lost in two cases: a wake expires after an outage
+longer than its 7-day window, or an admitted turn dies before it creates the
+successor. Installations therefore pair the chain with ONE daily backstop: a
+Fleet manifest loop targeted at the assistant role, with `interval: 24h` and a
+jitter of up to 1h. Its prompt is limited to repair:
+
+> Task-review backstop. Run `task_review.py status`. If `repair_needed` is
+> true, run `plan`, apply its `schedule` and record `chain`. Do nothing else:
+> no review, no message, no inbox or history read.
+
+This costs one short model turn per day per assistant, including empty
+passes. Fleet loops skip busy turns and coalesce downtime, so it never replays.
+The loop is operator configuration owned by the Fleet coordinator; this skill
+does not enable it. Without the loop, the chain is still repaired on the next
+ordinary user-message turn: run `status` when the chain was not seen current
+this session.
+

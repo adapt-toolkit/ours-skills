@@ -34,7 +34,11 @@ CREATE TABLE task_reviews(
  next_eligible_utc TEXT NOT NULL,reason TEXT NOT NULL,
  opted_out INTEGER NOT NULL DEFAULT 0 CHECK(opted_out IN (0,1)),
  covered_by TEXT,covered_until_utc TEXT,
- in_flight_attempt TEXT,closed_status TEXT);
+ in_flight_attempt TEXT,closed_status TEXT,send_state_key TEXT);
+CREATE TABLE responses(
+ wire_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,at_utc TEXT NOT NULL);
+CREATE TABLE chain_intent(
+ id INTEGER PRIMARY KEY CHECK(id=1),request_key TEXT NOT NULL,args_json TEXT NOT NULL,due_utc TEXT NOT NULL);
 CREATE TABLE review_log(
  attempt_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,at_utc TEXT NOT NULL,
  outcome TEXT NOT NULL,source_revision INTEGER NOT NULL,note TEXT);
@@ -191,6 +195,21 @@ def send_cooldown_until(row):
     return parse(row['last_send_utc']) + wait
 
 
+def state_key(t):
+    return '%d:%d' % (t['revision'], int(t['ready']))
+
+
+def send_block(row, t, at):
+    """Why a send is not allowed now (None if allowed). Cooldown from actual send time; an
+    exhausted unanswered budget stays exhausted until the task meaningfully changes or the user responds."""
+    if row['unanswered_sends'] >= MAX_UNANSWERED and row['send_state_key'] == state_key(t):
+        return 'repeat_budget_exhausted_unchanged'
+    cooldown = send_cooldown_until(row)
+    if cooldown is not None and cooldown > at:
+        return 'send_cooldown_until_' + iso(cooldown)
+    return None
+
+
 def sync(review, src, at):
     """Observe source; never writes source. Returns current task rows."""
     tasks = open_tasks(src)
@@ -260,12 +279,11 @@ def plan(review, src, at, cfg=None):
         t = tasks.get(r['task_id'])
         state, detail, due = classify(src, r, t, at)
         if state == 'eligible':
-            cooldown = send_cooldown_until(r)
             eligible.append({'id': r['task_id'], 'title': t['title'], 'revision': t['revision'],
                              'ready': bool(t['ready']), 'reason': detail,
                              'last_review_utc': r['last_review_utc'], 'last_outcome': r['last_outcome'],
                              'last_send_utc': r['last_send_utc'], 'unanswered_sends': r['unanswered_sends'],
-                             'send_allowed_after_utc': None if cooldown is None or cooldown <= at else iso(cooldown),
+                             'send_blocked': send_block(r, t, at),
                              'household_guard_required': r['task_id'].startswith('hh-'),
                              'claim_token': claim_token(r, t)})
         elif state == 'waiting':
@@ -295,8 +313,19 @@ def plan(review, src, at, cfg=None):
         if local.fold:
             spec['fold'] = 1
         if not chain_current:
-            key = 'task-review-' + hashlib.sha256((zone.key + iso(due_utc)).encode()).hexdigest()[:16]
-            schedule = {'action': 'create', 'args': spec | {'request_key': key}, 'due_utc': iso(due_utc)}
+            intent = review.execute('SELECT * FROM chain_intent WHERE id=1').fetchone()
+            if intent is not None and parse(intent['due_utc']) > at:
+                # A create may already have succeeded without a recorded receipt: repeat the SAME
+                # request (same key and input), which Fleet resolves to the existing reminder.
+                schedule = {'action': 'create', 'args': json.loads(intent['args_json']), 'due_utc': intent['due_utc'],
+                            'repeat_of_pending_intent': True}
+            else:
+                key = 'task-review-' + hashlib.sha256((zone.key + iso(due_utc)).encode()).hexdigest()[:16]
+                args = spec | {'request_key': key}
+                with source.atomic(review, True):
+                    review.execute('INSERT OR REPLACE INTO chain_intent VALUES (1,?,?,?)',
+                                   (key, json.dumps(args, sort_keys=True), iso(due_utc)))
+                schedule = {'action': 'create', 'args': args, 'due_utc': iso(due_utc)}
         elif due_utc < parse(chain['due_utc']) - timedelta(minutes=15):
             args = {'id': chain['reminder_id'], 'expected_revision': chain['revision'],
                     'local_time': spec['local_time'], 'time_zone': zone.key}
@@ -392,42 +421,43 @@ def household_guard(cfg, task_id, attempt):
 
 
 def begin_send(review, src, data, at, cfg=None):
-    """Durable CAS claim BEFORE any outward review message; every gate rechecked at actual time."""
+    """Durable CAS claim BEFORE any outward review message. All gates are evaluated inside one
+    sidecar write transaction against a fresh source snapshot; the household guard runs while
+    that lock is held."""
     if set(data) != {'task_id', 'attempt_id', 'source_revision', 'claim_token'}:
         raise ValueError('task_id, attempt_id, source_revision and claim_token from plan required')
     attempt = text(data['attempt_id'], 128)
-    prior = review.execute('SELECT * FROM send_claims WHERE attempt_id=?', (attempt,)).fetchone()
-    if prior is not None:
-        # Replay never re-authorizes: an existing claim must be closed via send_result/reconcile.
-        return {'status': 'already_claimed', 'attempt_id': attempt, 'state': prior['state'], 'send': False}
-    quiet = quiet_window(review, cfg)
-    if quiet['basis'] == 'unconfirmed_planning_only':
-        raise ValueError('quiet hours not confirmed by the user; review messages held')
-    zone = confirmed_zone(src)
-    if in_quiet(at, zone, quiet):
-        raise ValueError('inside confirmed quiet hours; send held')
-    row = _task_row(review, data['task_id'])
-    t = open_tasks(src).get(row['task_id'])
-    if t is None or t['status'] != 'open' or t['archived'] or row['closed_status']:
-        raise ValueError('task is not open in source')
-    if row['in_flight_attempt']:
-        raise ValueError('another send claim is in flight; reconcile it first')
-    if t['revision'] != data['source_revision'] or claim_token(row, t) != data['claim_token']:
-        raise ValueError('stale claim; run plan again')
-    state, detail, _ = classify(src, row, t, at)
-    if state != 'eligible':
-        raise ValueError('task not eligible: ' + detail)
-    cooldown = send_cooldown_until(row)
-    if cooldown is not None and cooldown > at:
-        raise ValueError('send cooldown active until ' + iso(cooldown))
-    if review.execute('SELECT COUNT(*) FROM send_claims WHERE claimed_utc>?', (iso(at - MIN_SPACING),)).fetchone()[0] >= MAX_SENDS_PER_WINDOW:
-        raise ValueError('review send budget for this window used')
-    guard = household_guard(cfg, row['task_id'], attempt) if row['task_id'].startswith('hh-') else None
     with source.atomic(review, True):
-        current = _task_row(review, row['task_id'])
-        if claim_token(current, t) != data['claim_token']:
-            raise ValueError('stale claim; run plan again')
-        review.execute('UPDATE task_reviews SET in_flight_attempt=? WHERE task_id=?', (attempt, row['task_id']))
+        prior = review.execute('SELECT * FROM send_claims WHERE attempt_id=?', (attempt,)).fetchone()
+        if prior is not None:
+            # Replay never re-authorizes: an existing claim is closed via send_result only.
+            return {'status': 'already_claimed', 'attempt_id': attempt, 'state': prior['state'], 'send': False}
+        quiet = quiet_window(review, cfg)
+        if quiet['basis'] == 'unconfirmed_planning_only':
+            raise ValueError('quiet hours not confirmed by the user; review messages held')
+        if in_quiet(at, confirmed_zone(src), quiet):
+            raise ValueError('inside confirmed quiet hours; send held')
+        row = _task_row(review, data['task_id'])
+        with source.atomic(src):
+            t = open_tasks(src).get(row['task_id'])
+            if t is None or t['status'] != 'open' or t['archived'] or row['closed_status']:
+                raise ValueError('task is not open in source')
+            if row['in_flight_attempt']:
+                raise ValueError('another send claim is in flight; reconcile it first')
+            if t['revision'] != data['source_revision'] or claim_token(row, t) != data['claim_token']:
+                raise ValueError('stale claim; run plan again')
+            state, detail, _ = classify(src, row, t, at)
+        if state != 'eligible':
+            raise ValueError('task not eligible: ' + detail)
+        blocked = send_block(row, t, at)
+        if blocked:
+            raise ValueError('send not allowed: ' + blocked)
+        if review.execute('SELECT COUNT(*) FROM send_claims WHERE claimed_utc>?',
+                          (iso(at - MIN_SPACING),)).fetchone()[0] >= MAX_SENDS_PER_WINDOW:
+            raise ValueError('review send budget for this window used')
+        guard = household_guard(cfg, row['task_id'], attempt) if row['task_id'].startswith('hh-') else None
+        review.execute('UPDATE task_reviews SET in_flight_attempt=?,send_state_key=? WHERE task_id=?',
+                       (attempt, state_key(t), row['task_id']))
         review.execute('INSERT INTO send_claims(attempt_id,task_id,claimed_utc,source_revision,guard_json,state) VALUES (?,?,?,?,?,?)',
                        (attempt, row['task_id'], iso(at), t['revision'], None if guard is None else json.dumps(guard), 'claimed'))
     return {'status': 'claimed', 'attempt_id': attempt, 'task_id': row['task_id'], 'send': True, 'household_guard': guard}
@@ -482,9 +512,14 @@ def responded(review, data, at, cfg=None):
     """The user actually engaged with this task in an incoming message: clears unanswered count only."""
     if set(data) != {'task_id', 'wire_id'}:
         raise ValueError('task_id and actual incoming wire_id required')
-    text(data['wire_id'], 256)
+    wire = text(data['wire_id'], 256)
     with source.atomic(review, True):
         row = _task_row(review, data['task_id'])
+        prior = review.execute('SELECT task_id FROM responses WHERE wire_id=?', (wire,)).fetchone()
+        if prior is not None:
+            # Replay of an already counted message never resets a later budget.
+            return {'status': 'already_recorded', 'task_id': prior['task_id']}
+        review.execute('INSERT INTO responses VALUES (?,?,?)', (wire, row['task_id'], iso(at)))
         review.execute('''UPDATE task_reviews SET unanswered_sends=0,reason='user_responded',
             next_eligible_utc=MAX(next_eligible_utc,?) WHERE task_id=?''', (iso(at + CHANGE_GRACE), row['task_id']))
     return {'status': 'recorded', 'task_id': row['task_id']}
@@ -513,6 +548,7 @@ def chain(review, data, at, cfg=None):
     if data == {'cancelled': True}:
         with source.atomic(review, True):
             review.execute('DELETE FROM review_chain WHERE id=1')
+            review.execute('DELETE FROM chain_intent')
         return {'status': 'chain_cleared'}
     if set(data) != {'reminder_id', 'revision', 'request_key', 'due_at'}:
         raise ValueError('actual fleet reminder id, revision, request_key and due_at required')
@@ -524,6 +560,7 @@ def chain(review, data, at, cfg=None):
     with source.atomic(review, True):
         review.execute('INSERT OR REPLACE INTO review_chain VALUES (1,?,?,?,?)',
                        (text(data['reminder_id'], 128), data['revision'], text(data['request_key'], 128), iso(due)))
+        review.execute('DELETE FROM chain_intent WHERE request_key=?', (data['request_key'],))
     return {'status': 'chain_recorded', 'due_utc': iso(due)}
 
 

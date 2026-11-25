@@ -98,7 +98,7 @@ class TaskReviewTest(unittest.TestCase):
         self.assertNotIn('t1', u.eligible(at + timedelta(hours=3)))       # no repeat question in 2-3h
         self.assertNotIn('t1', u.eligible(at + timedelta(hours=21)))
         e = u.eligible(at + timedelta(days=1, minutes=1))['t1']           # elapsed time, no hash change
-        self.assertIsNone(e['send_allowed_after_utc'])
+        self.assertIsNone(e['send_blocked'])
         self.assertEqual(e['reason'], 'awaiting_response_backoff')
 
     def test_unchanged_task_no_repeated_questions_and_budget_backoff(self):
@@ -109,7 +109,7 @@ class TaskReviewTest(unittest.TestCase):
             now = at + timedelta(hours=2.5 * i * 4)
             if 't1' in u.eligible(now):
                 e = u.eligible(now)['t1']
-                if e['send_allowed_after_utc'] is None:
+                if e['send_blocked'] is None:
                     u.send('t1', now, 'b%d' % i); sends.append(now)
                 else:
                     u.call('record', now, task_id='t1', attempt_id='r%d' % i, outcome='no_message')
@@ -127,11 +127,39 @@ class TaskReviewTest(unittest.TestCase):
         u.plan(at + timedelta(hours=1))                     # change observed
         later = at + timedelta(hours=4, minutes=1)
         e = u.eligible(later)['t1']                        # review brought forward...
-        self.assertIsNotNone(e['send_allowed_after_utc'])  # ...but send cooldown untouched
+        self.assertIsNotNone(e['send_blocked'])  # ...but send cooldown untouched
         with self.assertRaisesRegex(ValueError, 'cooldown'):
             u.call('begin_send', later, task_id='t1', attempt_id='c2', source_revision=e['revision'], claim_token=e['claim_token'])
         u.call('responded', later, task_id='t1', wire_id='synthetic-in-1')  # actual engagement resets
         self.assertEqual(u.call('status', later, task_id='t1')['task']['unanswered_sends'], 0)
+        # a later send, then a REPLAY of the old response must not reset the new budget
+        nxt = later + timedelta(days=2)
+        u.send('t1', nxt, 'c3')
+        self.assertEqual(u.call('responded', nxt, task_id='t1', wire_id='synthetic-in-1')['status'], 'already_recorded')
+        self.assertEqual(u.call('status', nxt, task_id='t1')['task']['unanswered_sends'], 1)
+
+    def test_exhausted_budget_never_nudges_unchanged_task(self):
+        u = self.u; u.put('t1'); u.plan(self.t0)
+        at = self.t0 + timedelta(days=1)
+        for i in range(3):
+            e = u.eligible(at)['t1']
+            self.assertIsNone(e['send_blocked'], (i, e))
+            u.send('t1', at, 'x%d' % i)
+            at = tr.parse(u.call('status', at, task_id='t1')['task']['next_eligible_utc']) + timedelta(minutes=1)
+        for k in range(10):  # months of unchanged silence: reviewed, never sent
+            now = at + timedelta(days=14 * k)
+            e = u.eligible(now).get('t1')
+            if e:
+                self.assertEqual(e['send_blocked'], 'repeat_budget_exhausted_unchanged')
+                with self.assertRaisesRegex(ValueError, 'exhausted'):
+                    u.call('begin_send', now, task_id='t1', attempt_id='y%d' % k, source_revision=e['revision'],
+                           claim_token=e['claim_token'])
+                u.call('record', now, task_id='t1', attempt_id='n%d' % k, outcome='no_message')
+        self.assertEqual(u.call('status', at, task_id='t1')['task']['total_sends'], 3)
+        u.put('t1', 'Synthetic task with real new information')  # meaningful change re-opens ONE send
+        now = at + timedelta(days=200)
+        e = u.eligible(now)['t1']
+        self.assertIsNone(e['send_blocked'])
 
     def test_completion_cancellation_and_opt_out_stop_returns(self):
         u = self.u
@@ -284,6 +312,9 @@ class TaskReviewTest(unittest.TestCase):
         u = self.u; u.put('t1')
         p = u.plan(self.t0)
         s = p['schedule']
+        # receipt lost after a successful create: later plans repeat the IDENTICAL request
+        again = u.plan(self.t0 + timedelta(hours=7))['schedule']
+        self.assertEqual(again['args'], s['args']); self.assertTrue(again['repeat_of_pending_intent'])
         self.assertEqual(s['action'], 'create')
         self.assertEqual(s['args']['late_window_seconds'], 604800)
         u.call('chain', self.t0, reminder_id='rem-1', revision=1, request_key=s['args']['request_key'],
