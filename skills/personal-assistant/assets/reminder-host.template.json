@@ -13,5 +13,6 @@
   "source_db": "/PRIVATE_USER_STATE/source.sqlite3",
   "source_schema": 2,
   "source_namespace": "REPLACE_WITH_PRIVATE_CANONICAL_UUID",
-  "source_journal": "/PRIVATE_USER_STATE/source.operations.sqlite"
+  "source_journal": "/PRIVATE_USER_STATE/source.operations.sqlite",
+  "task_review_db": "/PRIVATE_USER_STATE/task-review.sqlite"
 }

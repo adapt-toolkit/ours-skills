@@ -46,6 +46,10 @@ For EVERY authenticated Owner message, find an adequate objective, fact-based re
 
 For proactive follow-ups under standing delegation, work quietly: the Owner wants the useful conversational effect, without unsolicited announcements of selected times, timer creation, IDs or internal scheduling. Do not turn an internal follow-up into a technical status report. This explicit communication preference overrides default schedule-confirmation wording in this skill and its references for these proactive returns. Answer direct questions about plans/status accurately, honor explicitly requested confirmations, and disclose material failures or uncertainty when the Owner needs to know an intended action remains unperformed. It never permits claiming a reminder exists without a receipt or hiding a failure. Changes to this communication rule can receive a concise acknowledgement without listing internal timers.
 
+## Periodic open-task review
+
+When the host config sets `task_review_db`, follow [task review](references/task-review.md). It is a deterministic eligibility scan (`scripts/task_review.py`) over open source tasks with ONE native self-reminder chain. It brings back an open task after elapsed time or a meaningful change, without repeating the same question. Silence or a stated intent is never completion. Persist every review decision and every send claim/outcome there. Never send a review message without a `begin_send` claim. Honour opt-out, confirmed quiet hours and the per-task send backoff, and do not duplicate a purpose already owned by an exact-time timer or return. The user explicitly requested this periodic review; it does not enable any other periodic model work.
+
 ## Interactive widgets
 
 Use interactive widgets through the configured messaging route when they make a
@@ -84,7 +88,7 @@ replay their source/admission/delivery ledgers. Legacy scheduling and worker
 startup no longer require a route; only its explicit delivery actions do.
 
 
-Use configured deterministic reminder tools for create/list/update/cancel/snooze. No periodic LLM polling, model-driven cron, or extra scheduler may be enabled. The service can check clocks/state locally; it admits a model event only for an actual due reminder. Persisted schedule acceptance, event admission, confirmed message send and human receipt are distinct outcomes.
+Use configured deterministic reminder tools for create/list/update/cancel/snooze. No periodic LLM polling, model-driven cron, or extra scheduler may be enabled; the only exception is the [periodic open-task review](references/task-review.md) below when configured. The service can check clocks/state locally; it admits a model event only for an actual due reminder. Persisted schedule acceptance, event admission, confirmed message send and human receipt are distinct outcomes.
 
 Choose `fixed` (default) for a stored message, or `contextual` for a due-time review of a specified saved task/event. Contextual intake stores the purpose in concise title/context and an exact `source_ref` for source-bound checks (or the stored goal alone for a generic check); it does not authorize completing tasks or unrestricted sends. Follow-up permission is a finite `followup_limit` agreed within the user's purpose, default zero. Do not infer an ongoing chain from an ordinary reminder.
 

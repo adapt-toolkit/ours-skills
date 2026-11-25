@@ -43,6 +43,15 @@ configured Ours/Telegram tools and destination rules if sending. No outbound
 route may be required to schedule/handle a self-wake. Track actual send outcomes
 separately; do not replay uncertain sends.
 
+## Periodic task review chain
+
+The configured [task review](task-review.md) uses exactly one self-reminder at a
+time, as computed by `task_review.py plan`. Its wake note starts with
+`task_review`. Create its successor before reviewing, record the receipt with
+`chain`, and never create a second review reminder. Per-task native timers
+stay separate; register them with `cover` so the review does not duplicate
+them.
+
 ## Existing installations
 
 Preserve legacy source/admission/send ledgers and outstanding events. Do not bulk
