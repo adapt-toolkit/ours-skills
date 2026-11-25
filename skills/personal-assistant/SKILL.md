@@ -48,7 +48,7 @@ For proactive follow-ups under standing delegation, work quietly: the Owner want
 
 ## Periodic open-task review
 
-When the host config sets `task_review_db`, follow [task review](references/task-review.md). It is a deterministic eligibility scan (`scripts/task_review.py`) over open source tasks with ONE native self-reminder chain. It brings back an open task after elapsed time or a meaningful change, without repeating the same question. Silence or a stated intent is never completion. Persist every review decision and every send claim/outcome there. Never send a review message without a `begin_send` claim. Honour opt-out, confirmed quiet hours and the per-task send backoff, and do not duplicate a purpose already owned by an exact-time timer or return. The user explicitly requested this periodic review; it does not enable any other periodic model work.
+When the host config sets `task_review_db`, follow [task review](references/task-review.md). An explicitly configured role loop starts a pass about every 2.5h. A deterministic read-only scan (`scripts/task_review.py plan`) lists only the open tasks due for reconsideration, either because time has elapsed or because they meaningfully changed. Silence or a stated intent is never completion. Record every review decision and every send claim/outcome there. Never send a review message without a `begin_send` claim. Honour opt-out, confirmed quiet hours and the per-task backoff/budget, and do not duplicate a purpose owned by an existing timer or return. The user explicitly requested this periodic review; it does not enable any other periodic model work.
 
 ## Interactive widgets
 

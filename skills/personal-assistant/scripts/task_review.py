@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Durable periodic reconsideration of open source tasks.
 
-A deterministic scan of the configured schema2 source (opened read-only)
-decides which open tasks are eligible for reconsideration and when ONE native
-self-reminder should next wake the assistant. Review/send accounting lives in a
-separate private sidecar database; the source store, its writer, preferences,
-timers and delivery ledgers are never written here. This script sends nothing.
+Each periodic review pass (an explicitly configured Fleet role loop) runs
+`plan`: a deterministic scan of the configured schema2 source, opened
+read-only, that lists which open tasks are due for reconsideration. Review and
+send accounting live in a separate private sidecar database. The source store,
+its writer, preferences, timers, returns and delivery ledgers are never written
+here. This script sends nothing; an outward message needs a `begin_send` claim.
 """
 import argparse
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -30,15 +31,11 @@ CREATE TABLE task_reviews(
  first_seen_utc TEXT NOT NULL,last_review_utc TEXT,last_outcome TEXT,
  last_send_utc TEXT,last_send_wire TEXT,last_send_outcome TEXT,
  unanswered_sends INTEGER NOT NULL DEFAULT 0 CHECK(unanswered_sends>=0),
- total_sends INTEGER NOT NULL DEFAULT 0,
+ total_sends INTEGER NOT NULL DEFAULT 0,send_state_key TEXT,
  next_eligible_utc TEXT NOT NULL,reason TEXT NOT NULL,
  opted_out INTEGER NOT NULL DEFAULT 0 CHECK(opted_out IN (0,1)),
  covered_by TEXT,covered_until_utc TEXT,
- in_flight_attempt TEXT,closed_status TEXT,send_state_key TEXT);
-CREATE TABLE responses(
- wire_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,at_utc TEXT NOT NULL);
-CREATE TABLE chain_intent(
- id INTEGER PRIMARY KEY CHECK(id=1),request_key TEXT NOT NULL,args_json TEXT NOT NULL,due_utc TEXT NOT NULL);
+ in_flight_attempt TEXT,closed_status TEXT);
 CREATE TABLE review_log(
  attempt_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,at_utc TEXT NOT NULL,
  outcome TEXT NOT NULL,source_revision INTEGER NOT NULL,note TEXT);
@@ -48,26 +45,19 @@ CREATE TABLE send_claims(
  state TEXT NOT NULL CHECK(state IN ('claimed','sent','uncertain','failed','not_sent')),
  wire_id TEXT,closed_utc TEXT);
 CREATE INDEX send_claims_time ON send_claims(claimed_utc);
-CREATE TABLE review_chain(
- id INTEGER PRIMARY KEY CHECK(id=1),reminder_id TEXT NOT NULL,revision INTEGER NOT NULL,
- request_key TEXT NOT NULL,due_utc TEXT NOT NULL);
+CREATE TABLE responses(wire_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,incoming_utc TEXT NOT NULL);
 '''
 
-# Policy defaults (assistant-selected, documented in references/task-review.md).
-MIN_SPACING = timedelta(hours=2)          # between review wakes / per-window send budget
-FIRST_GRACE = timedelta(hours=24)         # new task: it was just discussed
-CHANGE_GRACE = timedelta(hours=3)         # source change: let the conversation settle
-NO_MESSAGE_DEFER = timedelta(hours=24)    # reviewed, nothing useful to say: reconsider daily
-FIRST_SPREAD_HOURS = 48                   # stagger first reviews (e.g. activation with many tasks)
-COALESCE = timedelta(hours=2)             # pull near-due tasks into the current wake
-MAX_REVIEW_PER_WAKE = 20
+# Policy defaults (assistant-selected; documented in references/task-review.md).
+REVIEW_INTERVAL = timedelta(hours=2)      # unchanged task: reconsidered on (about) every pass
+CHANGE_GRACE = timedelta(minutes=30)      # source change: let the live conversation settle
 SEND_BACKOFF = [timedelta(days=1), timedelta(days=2), timedelta(days=4)]
-MAX_UNANSWERED = 3                        # then slow reconsideration only
-SLOW_RECONSIDER = timedelta(days=14)
+MAX_UNANSWERED = 3                        # then no send until a meaningful change or a reply
 MAX_DEFER = timedelta(days=60)
-MAX_SENDS_PER_WINDOW = 3                  # send claims per 2h window across tasks
-LATE_WINDOW = 604800                      # one bounded catch-up wake after downtime
-PLANNING_QUIET = ('21:00', '09:00')       # wake placement only; never authorizes a send
+SEND_WINDOW = timedelta(hours=2)
+MAX_SENDS_PER_WINDOW = 3                  # outward review messages across tasks per window
+MAX_REVIEW_PER_PASS = 20                  # least recently reviewed first; rest next pass
+MAX_BATCH = 50
 REVIEW_OUTCOMES = ('no_message', 'deferred', 'opt_out', 'opt_in')
 SEND_OUTCOMES = ('sent', 'uncertain', 'failed', 'not_sent')
 
@@ -84,6 +74,14 @@ def parse(value):
     if not isinstance(value, str) or not value.endswith('Z'):
         raise ValueError('UTC timestamp ending Z required')
     return datetime.fromisoformat(value[:-1] + '+00:00')
+
+
+def when(value):
+    """Ledger/extension timestamps: epoch seconds or ISO with offset/Z."""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, timezone.utc)
+    v = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    return v if v.utcoffset() is not None else v.replace(tzinfo=timezone.utc)
 
 
 def text(value, limit=200):
@@ -130,7 +128,7 @@ def _hm(value):
 
 
 def quiet_window(review, cfg=None):
-    """User-confirmed quiet hours (sidecar, else operator-recorded); otherwise planning only."""
+    """User-confirmed quiet hours (sidecar, else operator-recorded confirmation), or None."""
     row = review.execute("SELECT value FROM review_meta WHERE key='quiet_hours'").fetchone()
     if row is not None:
         return json.loads(row[0])
@@ -140,25 +138,13 @@ def quiet_window(review, cfg=None):
         if _hm(bound['start']) == _hm(bound['end']):
             raise ValueError('invalid configured quiet hours')
         return {k: bound[k] for k in ('start', 'end', 'basis', 'confirmed_wire_id')}
-    return {'start': PLANNING_QUIET[0], 'end': PLANNING_QUIET[1], 'basis': 'unconfirmed_planning_only'}
+    return None
 
 
 def in_quiet(at, zone, quiet):
     local = at.astimezone(zone).time()
     start, end = _hm(quiet['start']), _hm(quiet['end'])
     return (start <= local < end) if start < end else (local >= start or local < end)
-
-
-def out_of_quiet(at, zone, quiet):
-    """Earliest instant >= at outside quiet hours, in the user's zone."""
-    if not in_quiet(at, zone, quiet):
-        return at
-    local = at.astimezone(zone)
-    end = _hm(quiet['end'])
-    candidate = datetime.combine(local.date(), end, tzinfo=zone)
-    if candidate <= local:
-        candidate = datetime.combine(local.date() + timedelta(days=1), end, tzinfo=zone)
-    return candidate.astimezone(timezone.utc)
 
 
 def confirmed_zone(src):
@@ -176,32 +162,55 @@ def open_tasks(src):
     return {r['id']: r for r in rows}
 
 
-def legacy_covered(src, task_id):
-    """An active legacy source-bound reminder already owns this task's next return."""
+def _rows(db, sql, args):
     try:
-        row = src.execute("SELECT reminder_id FROM reminder_mappings WHERE source_ref=? AND status='active' LIMIT 1",
-                          ('task:' + task_id,)).fetchone()
-    except sqlite3.Error:
-        return None
-    return None if row is None else row['reminder_id']
+        return db.execute(sql, args).fetchall()
+    except sqlite3.Error:  # optional extension table absent in this installation
+        return []
 
 
-def send_cooldown_until(row):
-    """Send spacing from the actual last send; never shortened by source changes or restarts."""
-    if row['last_send_utc'] is None or row['unanswered_sends'] == 0:
-        return None
-    n = row['unanswered_sends']
-    wait = SLOW_RECONSIDER if n >= MAX_UNANSWERED else SEND_BACKOFF[min(n - 1, len(SEND_BACKOFF) - 1)]
-    return parse(row['last_send_utc']) + wait
+def existing_mechanism(src, ledger, task_id, at):
+    """(kind, until) when an existing timer/return already owns this task's next return.
+    Legacy mappings are verified against the delivery ledger, so a naturally finished
+    reminder whose source mapping still reads 'active' does not suppress the task forever."""
+    ref = 'task:' + task_id
+    for m in _rows(src, "SELECT reminder_id FROM reminder_mappings WHERE source_ref=? AND status='active'", (ref,)):
+        if ledger is None:
+            return 'legacy_timer_unverified', None
+        if _rows(ledger, "SELECT 1 FROM events WHERE reminder_id=? AND status IN ('pending','sending','submitting','uncertain')",
+                 (m['reminder_id'],)):
+            return 'legacy_timer_in_delivery', None
+        r = _rows(ledger, 'SELECT status,expires FROM reminders WHERE id=?', (m['reminder_id'],))
+        if r and r[0]['status'] == 'active' and when(r[0]['expires']) > at:
+            return 'legacy_timer', when(r[0]['expires'])
+    for r in _rows(src, 'SELECT deadline FROM note_rules WHERE source_ref=? AND active=1 AND remaining>0 '
+                        'AND invalidated_by IS NULL', (ref,)):
+        if when(r['deadline']) > at:
+            return 'message_return_rule', when(r['deadline'])
+    for r in _rows(src, "SELECT deadline FROM return_decisions WHERE source_ref=? "
+                        "AND decision IN ('planned_timed','planned_message','committed_message')", (ref,)):
+        if r['deadline'] and when(r['deadline']) > at:
+            return 'contextual_return', when(r['deadline'])
+    if _rows(src, "SELECT 1 FROM task_trigger_reservations WHERE task_id=? AND status='prepared'", (task_id,)):
+        return 'task_trigger_pending', None
+    return None, None
 
 
 def state_key(t):
     return '%d:%d' % (t['revision'], int(t['ready']))
 
 
+def send_cooldown_until(row):
+    if row['last_send_utc'] is None or row['unanswered_sends'] == 0:
+        return None
+    n = row['unanswered_sends']
+    return parse(row['last_send_utc']) + SEND_BACKOFF[min(n - 1, len(SEND_BACKOFF) - 1)]
+
+
 def send_block(row, t, at):
-    """Why a send is not allowed now (None if allowed). Cooldown from actual send time; an
-    exhausted unanswered budget stays exhausted until the task meaningfully changes or the user responds."""
+    """Why an outward review message is not allowed now (None if allowed). The cooldown runs
+    from the actual last send; an exhausted unanswered budget stays exhausted until the task
+    meaningfully changes after that send or the user responds."""
     if row['unanswered_sends'] >= MAX_UNANSWERED and row['send_state_key'] == state_key(t):
         return 'repeat_budget_exhausted_unchanged'
     cooldown = send_cooldown_until(row)
@@ -220,7 +229,7 @@ def sync(review, src, at):
             if live:
                 review.execute('''INSERT INTO task_reviews(task_id,seen_revision,seen_ready,first_seen_utc,
                     next_eligible_utc,reason) VALUES (?,?,?,?,?,?)''',
-                               (task_id, t['revision'], int(t['ready']), iso(at), iso(first_due(task_id, at)), 'first_seen'))
+                               (task_id, t['revision'], int(t['ready']), iso(at), iso(at), 'first_seen'))
             continue
         if not live:
             if row['closed_status'] is None:
@@ -230,7 +239,7 @@ def sync(review, src, at):
         if row['closed_status'] is not None:  # explicitly reopened in source
             review.execute('UPDATE task_reviews SET closed_status=NULL WHERE task_id=?', (task_id,))
         if t['revision'] != row['seen_revision'] or int(t['ready']) != row['seen_ready']:
-            # A meaningful change may bring REVIEW forward; send budget/cooldown untouched.
+            # A meaningful change brings REVIEW forward; it never touches send cooldown/budget.
             target = min(parse(row['next_eligible_utc']), at + CHANGE_GRACE)
             why = 'became_ready' if t['ready'] and not row['seen_ready'] else 'source_changed'
             review.execute('UPDATE task_reviews SET seen_revision=?,seen_ready=?,next_eligible_utc=?,reason=? WHERE task_id=?',
@@ -238,46 +247,43 @@ def sync(review, src, at):
     return tasks
 
 
-def first_due(task_id, at):
-    spread = int(hashlib.sha256(task_id.encode()).hexdigest()[:8], 16) % (FIRST_SPREAD_HOURS * 60)
-    return at + FIRST_GRACE + timedelta(minutes=spread)
-
-
 def claim_token(row, t):
     state = [row['task_id'], t['revision'], int(t['ready']), row['next_eligible_utc'], row['last_send_utc'],
-             row['unanswered_sends'], row['opted_out'], row['in_flight_attempt'], row['covered_until_utc']]
+             row['unanswered_sends'], row['send_state_key'], row['opted_out'], row['in_flight_attempt'],
+             row['covered_until_utc']]
     return hashlib.sha256(json.dumps(state).encode()).hexdigest()[:24]
 
 
-def classify(src, row, t, at):
-    """Deterministic review eligibility of one tracked task now: (state, detail, wait_until)."""
+def classify(src, ledger, row, t, at):
+    """Deterministic review eligibility of one tracked task now: (state, detail)."""
     if t is None:
-        return 'held', 'source_missing', None
+        return 'held', 'source_missing'
     if row['opted_out']:
-        return 'opted_out', 'user_opted_out', None
+        return 'opted_out', 'user_opted_out'
     if row['in_flight_attempt']:
-        return 'held', 'uncertain_send_reconcile_first', None
-    if legacy_covered(src, row['task_id']) is not None:
-        return 'held', 'covered_by_existing_timer', None
-    due = parse(row['next_eligible_utc'])
+        return 'held', 'uncertain_send_reconcile_first'
+    kind, _ = existing_mechanism(src, ledger, row['task_id'], at)
+    if kind is not None:
+        return 'held', 'covered_by_' + kind  # reconcile, never duplicate its purpose
     if row['covered_until_utc'] and parse(row['covered_until_utc']) > at:
-        # An exact-time timer owns this purpose until it has fired; never pre-empt it.
-        return 'waiting', 'covered_by_native_timer', max(due, parse(row['covered_until_utc']))
-    if due > at + COALESCE:
-        return 'waiting', row['reason'], due
-    return 'eligible', row['reason'], None
+        return 'held', 'covered_by_native_timer'
+    if parse(row['next_eligible_utc']) > at:
+        return 'waiting', row['reason']
+    return 'eligible', row['reason']
 
 
-def plan(review, src, at, cfg=None):
+def plan(review, src, at, cfg=None, ledger=None):
     zone = confirmed_zone(src)
     quiet = quiet_window(review, cfg)
+    quiet_now = quiet is not None and in_quiet(at, zone, quiet)
     with source.atomic(review, True):
-        tasks = sync(review, src, at)
-        rows = review.execute('SELECT * FROM task_reviews WHERE closed_status IS NULL ORDER BY next_eligible_utc,task_id').fetchall()
-    eligible, held, waits = [], [], []
-    for r in rows:
-        t = tasks.get(r['task_id'])
-        state, detail, due = classify(src, r, t, at)
+        with source.atomic(src):
+            tasks = sync(review, src, at)
+            rows = review.execute('''SELECT * FROM task_reviews WHERE closed_status IS NULL
+                ORDER BY COALESCE(last_review_utc,''),task_id''').fetchall()
+            states = [(r, tasks.get(r['task_id'])) + classify(src, ledger, r, tasks.get(r['task_id']), at) for r in rows]
+    eligible, held, waiting = [], [], 0
+    for r, t, state, detail in states:
         if state == 'eligible':
             eligible.append({'id': r['task_id'], 'title': t['title'], 'revision': t['revision'],
                              'ready': bool(t['ready']), 'reason': detail,
@@ -286,61 +292,17 @@ def plan(review, src, at, cfg=None):
                              'send_blocked': send_block(r, t, at),
                              'household_guard_required': r['task_id'].startswith('hh-'),
                              'claim_token': claim_token(r, t)})
-        elif state == 'waiting':
-            waits.append(due)
         elif state == 'held':
             held.append({'id': r['task_id'], 'reason': detail})
-    quiet_now = in_quiet(at, zone, quiet)
-    batch = [] if quiet_now else eligible[:MAX_REVIEW_PER_WAKE]
-    deferred = len(eligible) - len(batch)
-    candidates = waits + ([at + MIN_SPACING] if eligible else [])
-    chain = review.execute('SELECT * FROM review_chain WHERE id=1').fetchone()
-    chain_current = chain is not None and parse(chain['due_utc']) > at
-    schedule = None
-    if candidates:
-        target = max(min(candidates), at + timedelta(minutes=5))
-        if chain is not None and not chain_current:
-            target = max(target, parse(chain['due_utc']) + MIN_SPACING)
-        target = out_of_quiet(target, zone, quiet)
-        local = target.astimezone(zone).replace(second=0, microsecond=0)
-        if local.astimezone(timezone.utc) < target:
-            local = (local + timedelta(minutes=1)).astimezone(timezone.utc).astimezone(zone)
-        due_utc = local.astimezone(timezone.utc)
-        spec = {'title': 'Reconsider open personal tasks',
-                'note': 'task_review predicted eligibility only: run plan first; tasks may have changed.',
-                'local_time': local.replace(tzinfo=None).isoformat(timespec='minutes'),
-                'time_zone': zone.key, 'late_window_seconds': LATE_WINDOW}
-        if local.fold:
-            spec['fold'] = 1
-        if not chain_current:
-            intent = review.execute('SELECT * FROM chain_intent WHERE id=1').fetchone()
-            if intent is not None and parse(intent['due_utc']) > at:
-                # A create may already have succeeded without a recorded receipt: repeat the SAME
-                # request (same key and input), which Fleet resolves to the existing reminder.
-                schedule = {'action': 'create', 'args': json.loads(intent['args_json']), 'due_utc': intent['due_utc'],
-                            'repeat_of_pending_intent': True}
-            else:
-                key = 'task-review-' + hashlib.sha256((zone.key + iso(due_utc)).encode()).hexdigest()[:16]
-                args = spec | {'request_key': key}
-                with source.atomic(review, True):
-                    review.execute('INSERT OR REPLACE INTO chain_intent VALUES (1,?,?,?)',
-                                   (key, json.dumps(args, sort_keys=True), iso(due_utc)))
-                schedule = {'action': 'create', 'args': args, 'due_utc': iso(due_utc)}
-        elif due_utc < parse(chain['due_utc']) - timedelta(minutes=15):
-            args = {'id': chain['reminder_id'], 'expected_revision': chain['revision'],
-                    'local_time': spec['local_time'], 'time_zone': zone.key}
-            if local.fold:
-                args['fold'] = 1
-            schedule = {'action': 'update', 'args': args, 'due_utc': iso(due_utc)}
-    elif chain_current:
-        schedule = {'action': 'cancel', 'args': {'id': chain['reminder_id'], 'expected_revision': chain['revision']}}
+        elif state == 'waiting':
+            waiting += 1
+    batch = [] if quiet_now else eligible[:MAX_REVIEW_PER_PASS]
     return {'status': 'ok', 'data_only': True, 'now_utc': iso(at), 'time_zone': zone.key,
             'quiet_hours': quiet, 'quiet_now': quiet_now,
-            'sends_possible': quiet['basis'] != 'unconfirmed_planning_only' and not quiet_now,
-            'eligible': batch, 'eligible_deferred': deferred, 'held': held, 'open_tracked': len(rows),
-            'chain': None if chain is None else {'reminder_id': chain['reminder_id'], 'revision': chain['revision'],
-                                                 'due_utc': chain['due_utc'], 'current': chain_current},
-            'schedule': schedule}
+            'sends_possible': quiet is not None and not quiet_now,
+            'eligible': batch, 'eligible_next_pass': len(eligible) - len(batch),
+            'held': held, 'waiting': waiting, 'open_tracked': len(rows),
+            'action': 'end_turn_quietly' if not batch else 'review_listed_tasks'}
 
 
 def _task_row(review, task_id):
@@ -350,22 +312,8 @@ def _task_row(review, task_id):
     return row
 
 
-def _defer(review, task_id, outcome, wait, reason, at, rev, attempt, note, chosen=None):
-    nxt = at + wait
-    if chosen is not None:
-        chosen = parse(chosen)
-        if not at + timedelta(minutes=30) <= chosen <= at + MAX_DEFER:
-            raise ValueError('next_review_utc must be 30 minutes to 60 days ahead')
-        nxt, reason = chosen, reason + ':assistant_selected_time'
-    review.execute('UPDATE task_reviews SET last_review_utc=?,last_outcome=?,next_eligible_utc=?,reason=? WHERE task_id=?',
-                   (iso(at), outcome, iso(nxt), reason, task_id))
-    review.execute('INSERT INTO review_log VALUES (?,?,?,?,?,?)', (attempt, task_id, iso(at), outcome, rev, note))
-    return nxt, reason
-
-
-def record(review, src, data, at, cfg=None):
-    """Truthful non-send review decision (or opt-out/opt-in). Idempotent by attempt_id."""
-    if set(data) - {'task_id', 'attempt_id', 'outcome', 'note', 'next_review_utc'} or \
+def _decide(review, src, data, at):
+    if not isinstance(data, dict) or set(data) - {'task_id', 'attempt_id', 'outcome', 'note', 'next_review_utc'} or \
             not {'task_id', 'attempt_id', 'outcome'} <= set(data):
         raise ValueError('task_id, attempt_id and outcome required')
     outcome = data['outcome']
@@ -373,29 +321,41 @@ def record(review, src, data, at, cfg=None):
         raise ValueError('review outcome must be no_message|deferred|opt_out|opt_in; sends use begin_send/send_result')
     attempt = text(data['attempt_id'], 128)
     note = None if data.get('note') is None else text(data['note'], 300)
-    with source.atomic(review, True):
-        row = _task_row(review, data['task_id'])
-        prior = review.execute('SELECT * FROM review_log WHERE attempt_id=?', (attempt,)).fetchone()
-        if prior is not None:
-            if prior['outcome'] == outcome and prior['task_id'] == row['task_id']:
-                return {'status': 'already_recorded', 'attempt_id': attempt}
-            raise ValueError('attempt_id already used')
-        t = open_tasks(src).get(row['task_id'])
-        rev = t['revision'] if t else row['seen_revision']
-        if outcome == 'opt_out':
-            review.execute('UPDATE task_reviews SET opted_out=1 WHERE task_id=?', (row['task_id'],))
-            nxt, reason = _defer(review, row['task_id'], outcome, MAX_DEFER, 'user_opted_out', at, rev, attempt, note)
-        elif outcome == 'opt_in':
-            review.execute('UPDATE task_reviews SET opted_out=0 WHERE task_id=?', (row['task_id'],))
-            nxt, reason = _defer(review, row['task_id'], outcome, timedelta(0), 'user_opted_in', at, rev, attempt, note)
-        else:
-            if row['in_flight_attempt']:
-                raise ValueError('reconcile the in-flight send claim first')
-            wait = NO_MESSAGE_DEFER if outcome == 'no_message' else MIN_SPACING
-            nxt, reason = _defer(review, row['task_id'], outcome, wait, outcome, at, rev, attempt, note,
-                                 data.get('next_review_utc'))
+    row = _task_row(review, data['task_id'])
+    prior = review.execute('SELECT * FROM review_log WHERE attempt_id=?', (attempt,)).fetchone()
+    if prior is not None:
+        if prior['outcome'] == outcome and prior['task_id'] == row['task_id']:
+            return {'status': 'already_recorded', 'attempt_id': attempt, 'task_id': row['task_id']}
+        raise ValueError('attempt_id already used')
+    t = open_tasks(src).get(row['task_id'])
+    rev = t['revision'] if t else row['seen_revision']
+    if outcome in ('no_message', 'deferred') and row['in_flight_attempt']:
+        raise ValueError('reconcile the in-flight send claim first')
+    wait = {'no_message': REVIEW_INTERVAL, 'deferred': REVIEW_INTERVAL, 'opt_out': MAX_DEFER, 'opt_in': timedelta(0)}[outcome]
+    reason = {'opt_out': 'user_opted_out', 'opt_in': 'user_opted_in'}.get(outcome, outcome)
+    nxt = at + wait
+    if data.get('next_review_utc') is not None and outcome in ('no_message', 'deferred'):
+        chosen = parse(data['next_review_utc'])
+        if not at + timedelta(minutes=30) <= chosen <= at + MAX_DEFER:
+            raise ValueError('next_review_utc must be 30 minutes to 60 days ahead')
+        nxt, reason = chosen, reason + ':assistant_selected_time'
+    if outcome in ('opt_out', 'opt_in'):
+        review.execute('UPDATE task_reviews SET opted_out=? WHERE task_id=?', (int(outcome == 'opt_out'), row['task_id']))
+    review.execute('UPDATE task_reviews SET last_review_utc=?,last_outcome=?,next_eligible_utc=?,reason=? WHERE task_id=?',
+                   (iso(at), outcome, iso(nxt), reason, row['task_id']))
+    review.execute('INSERT INTO review_log VALUES (?,?,?,?,?,?)', (attempt, row['task_id'], iso(at), outcome, rev, note))
     return {'status': 'recorded', 'attempt_id': attempt, 'task_id': row['task_id'], 'outcome': outcome,
             'next_eligible_utc': iso(nxt), 'reason': reason}
+
+
+def record(review, src, data, at, cfg=None, ledger=None):
+    """Truthful non-send review decision(s). `decisions` records several in one transaction."""
+    with source.atomic(review, True):
+        if 'decisions' in data:
+            if set(data) != {'decisions'} or not isinstance(data['decisions'], list) or not 1 <= len(data['decisions']) <= MAX_BATCH:
+                raise ValueError('decisions: 1..50 decision objects')
+            return {'status': 'recorded', 'results': [_decide(review, src, d, at) for d in data['decisions']]}
+        return _decide(review, src, data, at)
 
 
 def household_guard(cfg, task_id, attempt):
@@ -420,10 +380,28 @@ def household_guard(cfg, task_id, attempt):
     return {'reason': guard.get('reason'), 'rev': guard.get('rev'), 'binding': rid}
 
 
-def begin_send(review, src, data, at, cfg=None):
-    """Durable CAS claim BEFORE any outward review message. All gates are evaluated inside one
-    sidecar write transaction against a fresh source snapshot; the household guard runs while
-    that lock is held."""
+def _claimable(review, src, ledger, row, data, at):
+    with source.atomic(src):
+        t = open_tasks(src).get(row['task_id'])
+        if t is None or t['status'] != 'open' or t['archived'] or row['closed_status']:
+            raise ValueError('task is not open in source')
+        if row['in_flight_attempt']:
+            raise ValueError('another send claim is in flight; reconcile it first')
+        if t['revision'] != data['source_revision'] or claim_token(row, t) != data['claim_token']:
+            raise ValueError('stale claim; run plan again')
+        state, detail = classify(src, ledger, row, t, at)
+    if state != 'eligible':
+        raise ValueError('task not eligible: ' + detail)
+    blocked = send_block(row, t, at)
+    if blocked:
+        raise ValueError('send not allowed: ' + blocked)
+    return t
+
+
+def begin_send(review, src, data, at, cfg=None, ledger=None):
+    """Durable CAS claim BEFORE any outward review message. Every gate is evaluated inside one
+    sidecar write transaction against fresh source snapshots taken before AND after the
+    household guard, which runs while the sidecar lock is held."""
     if set(data) != {'task_id', 'attempt_id', 'source_revision', 'claim_token'}:
         raise ValueError('task_id, attempt_id, source_revision and claim_token from plan required')
     attempt = text(data['attempt_id'], 128)
@@ -433,29 +411,18 @@ def begin_send(review, src, data, at, cfg=None):
             # Replay never re-authorizes: an existing claim is closed via send_result only.
             return {'status': 'already_claimed', 'attempt_id': attempt, 'state': prior['state'], 'send': False}
         quiet = quiet_window(review, cfg)
-        if quiet['basis'] == 'unconfirmed_planning_only':
+        if quiet is None:
             raise ValueError('quiet hours not confirmed by the user; review messages held')
         if in_quiet(at, confirmed_zone(src), quiet):
             raise ValueError('inside confirmed quiet hours; send held')
-        row = _task_row(review, data['task_id'])
-        with source.atomic(src):
-            t = open_tasks(src).get(row['task_id'])
-            if t is None or t['status'] != 'open' or t['archived'] or row['closed_status']:
-                raise ValueError('task is not open in source')
-            if row['in_flight_attempt']:
-                raise ValueError('another send claim is in flight; reconcile it first')
-            if t['revision'] != data['source_revision'] or claim_token(row, t) != data['claim_token']:
-                raise ValueError('stale claim; run plan again')
-            state, detail, _ = classify(src, row, t, at)
-        if state != 'eligible':
-            raise ValueError('task not eligible: ' + detail)
-        blocked = send_block(row, t, at)
-        if blocked:
-            raise ValueError('send not allowed: ' + blocked)
         if review.execute('SELECT COUNT(*) FROM send_claims WHERE claimed_utc>?',
-                          (iso(at - MIN_SPACING),)).fetchone()[0] >= MAX_SENDS_PER_WINDOW:
+                          (iso(at - SEND_WINDOW),)).fetchone()[0] >= MAX_SENDS_PER_WINDOW:
             raise ValueError('review send budget for this window used')
+        row = _task_row(review, data['task_id'])
+        t = _claimable(review, src, ledger, row, data, at)
         guard = household_guard(cfg, row['task_id'], attempt) if row['task_id'].startswith('hh-') else None
+        if state_key(_claimable(review, src, ledger, row, data, at)) != state_key(t):
+            raise ValueError('source changed during claim; run plan again')
         review.execute('UPDATE task_reviews SET in_flight_attempt=?,send_state_key=? WHERE task_id=?',
                        (attempt, state_key(t), row['task_id']))
         review.execute('INSERT INTO send_claims(attempt_id,task_id,claimed_utc,source_revision,guard_json,state) VALUES (?,?,?,?,?,?)',
@@ -465,7 +432,7 @@ def begin_send(review, src, data, at, cfg=None):
 
 def send_result(review, data, at, cfg=None):
     """Record the ACTUAL transport outcome of a claimed attempt. `uncertain` keeps it held."""
-    if set(data) - {'attempt_id', 'outcome', 'wire_id', 'next_review_utc'} or not {'attempt_id', 'outcome'} <= set(data):
+    if set(data) - {'attempt_id', 'outcome', 'wire_id'} or not {'attempt_id', 'outcome'} <= set(data):
         raise ValueError('attempt_id and outcome required')
     outcome = data['outcome']
     if outcome not in SEND_OUTCOMES:
@@ -481,87 +448,75 @@ def send_result(review, data, at, cfg=None):
         if claim['state'] == 'uncertain' and outcome == 'uncertain':
             return {'status': 'already_recorded', 'attempt_id': claim['attempt_id'], 'state': 'uncertain'}
         row = _task_row(review, claim['task_id'])
-        wire = text(data['wire_id'], 256) if outcome == 'sent' else None
         if outcome == 'uncertain':
             review.execute("UPDATE send_claims SET state='uncertain' WHERE attempt_id=?", (claim['attempt_id'],))
             review.execute("UPDATE task_reviews SET last_send_outcome='uncertain',reason='uncertain_send_reconcile_first' WHERE task_id=?",
                            (row['task_id'],))
             return {'status': 'held_uncertain', 'attempt_id': claim['attempt_id'],
                     'action': 'check your own outbound history, then send_result sent(+wire_id) or not_sent'}
+        wire = text(data.get('wire_id'), 256) if outcome == 'sent' else None
         review.execute('UPDATE send_claims SET state=?,wire_id=?,closed_utc=? WHERE attempt_id=?',
                        (outcome, wire, iso(at), claim['attempt_id']))
         if outcome == 'sent':
             sent_at = parse(claim['claimed_utc'])
             n = row['unanswered_sends'] + 1
-            wait = SLOW_RECONSIDER if n >= MAX_UNANSWERED else SEND_BACKOFF[min(n - 1, len(SEND_BACKOFF) - 1)]
-            reason = 'repeat_budget_exhausted_slow_reconsider' if n >= MAX_UNANSWERED else 'awaiting_response_backoff'
-            nxt = sent_at + wait
+            reason = 'awaiting_response' if n < MAX_UNANSWERED else 'repeat_budget_exhausted'
             review.execute('''UPDATE task_reviews SET last_review_utc=?,last_outcome='sent',last_send_utc=?,last_send_wire=?,
                 last_send_outcome='sent',unanswered_sends=?,total_sends=total_sends+1,in_flight_attempt=NULL,
                 next_eligible_utc=?,reason=? WHERE task_id=?''',
-                           (iso(at), iso(sent_at), wire, n, iso(nxt), reason, row['task_id']))
+                           (iso(at), iso(sent_at), wire, n, iso(at + REVIEW_INTERVAL), reason, row['task_id']))
         else:
-            nxt, reason = at + MIN_SPACING, 'send_' + outcome
+            reason = 'send_' + outcome
             review.execute('''UPDATE task_reviews SET last_review_utc=?,last_outcome=?,last_send_outcome=?,in_flight_attempt=NULL,
-                next_eligible_utc=?,reason=? WHERE task_id=?''', (iso(at), outcome, outcome, iso(nxt), reason, row['task_id']))
+                next_eligible_utc=?,reason=? WHERE task_id=?''', (iso(at), outcome, outcome, iso(at + REVIEW_INTERVAL), reason, row['task_id']))
     return {'status': 'recorded', 'attempt_id': claim['attempt_id'], 'task_id': row['task_id'], 'outcome': outcome,
-            'next_eligible_utc': iso(nxt), 'reason': reason}
+            'reason': reason}
 
 
 def responded(review, data, at, cfg=None):
-    """The user actually engaged with this task in an incoming message: clears unanswered count only."""
-    if set(data) != {'task_id', 'wire_id'}:
-        raise ValueError('task_id and actual incoming wire_id required')
+    """The user actually engaged with this task: clears the unanswered count, once per wire, and
+    only for a message that arrived after the last review message."""
+    if set(data) != {'task_id', 'wire_id', 'incoming_utc'}:
+        raise ValueError('task_id, actual incoming wire_id and its incoming_utc required')
     wire = text(data['wire_id'], 256)
+    incoming = parse(data['incoming_utc'])
+    if incoming > at + timedelta(minutes=5):
+        raise ValueError('incoming_utc in the future')
     with source.atomic(review, True):
         row = _task_row(review, data['task_id'])
         prior = review.execute('SELECT task_id FROM responses WHERE wire_id=?', (wire,)).fetchone()
         if prior is not None:
-            # Replay of an already counted message never resets a later budget.
             return {'status': 'already_recorded', 'task_id': prior['task_id']}
-        review.execute('INSERT INTO responses VALUES (?,?,?)', (wire, row['task_id'], iso(at)))
-        review.execute('''UPDATE task_reviews SET unanswered_sends=0,reason='user_responded',
-            next_eligible_utc=MAX(next_eligible_utc,?) WHERE task_id=?''', (iso(at + CHANGE_GRACE), row['task_id']))
+        review.execute('INSERT INTO responses VALUES (?,?,?)', (wire, row['task_id'], iso(incoming)))
+        if row['last_send_utc'] is not None and incoming <= parse(row['last_send_utc']):
+            return {'status': 'recorded_no_reset', 'task_id': row['task_id'], 'reason': 'response_predates_last_send'}
+        review.execute("UPDATE task_reviews SET unanswered_sends=0,reason='user_responded' WHERE task_id=?", (row['task_id'],))
     return {'status': 'recorded', 'task_id': row['task_id']}
 
 
 def cover(review, data, at, cfg=None):
-    """Register a native exact-time self-reminder that already covers this task's next return."""
-    if set(data) - {'task_id', 'reminder_id', 'due_utc', 'clear'} or 'task_id' not in data:
-        raise ValueError('task_id with reminder_id and due_utc, or clear:true, required')
+    """Register an ACTUAL native self-reminder receipt that already owns this task's next return.
+    Coverage lasts until its late-window expiry; update it when the reminder changes and clear it
+    when that reminder is cancelled or handled."""
+    if data.get('clear') is True:
+        if set(data) != {'task_id', 'clear'}:
+            raise ValueError('task_id and clear:true only')
+        with source.atomic(review, True):
+            row = _task_row(review, data['task_id'])
+            review.execute('UPDATE task_reviews SET covered_by=NULL,covered_until_utc=NULL WHERE task_id=?', (row['task_id'],))
+        return {'status': 'cleared', 'task_id': row['task_id']}
+    if set(data) != {'task_id', 'reminder_id', 'revision', 'due_at', 'expires_at'}:
+        raise ValueError('task_id plus the actual reminder id, revision, due_at and expires_at required')
+    if type(data['revision']) is not int or data['revision'] < 1:
+        raise ValueError('positive reminder revision required')
+    due, expires = when(text(data['due_at'], 64)), when(text(data['expires_at'], 64))
+    if not due <= expires or expires <= at or expires > at + timedelta(days=1840):
+        raise ValueError('current reminder receipt required')
     with source.atomic(review, True):
         row = _task_row(review, data['task_id'])
-        if data.get('clear') is True:
-            review.execute('UPDATE task_reviews SET covered_by=NULL,covered_until_utc=NULL WHERE task_id=?', (row['task_id'],))
-            return {'status': 'cleared', 'task_id': row['task_id']}
-        due = parse(data['due_utc'])
-        if due <= at or due > at + timedelta(days=1830):
-            raise ValueError('future due_utc required')
-        until = due + timedelta(hours=1)
         review.execute('UPDATE task_reviews SET covered_by=?,covered_until_utc=? WHERE task_id=?',
-                       (text(data['reminder_id'], 128), iso(until), row['task_id']))
-    return {'status': 'covered', 'task_id': row['task_id'], 'until_utc': iso(until)}
-
-
-def chain(review, data, at, cfg=None):
-    """Record the receipt of the ONE review self-reminder actually created/updated (or cancelled)."""
-    if data == {'cancelled': True}:
-        with source.atomic(review, True):
-            review.execute('DELETE FROM review_chain WHERE id=1')
-            review.execute('DELETE FROM chain_intent')
-        return {'status': 'chain_cleared'}
-    if set(data) != {'reminder_id', 'revision', 'request_key', 'due_at'}:
-        raise ValueError('actual fleet reminder id, revision, request_key and due_at required')
-    if type(data['revision']) is not int or data['revision'] < 1:
-        raise ValueError('positive revision required')
-    due = datetime.fromisoformat(text(data['due_at'], 64).replace('Z', '+00:00'))
-    if due.utcoffset() is None:
-        raise ValueError('due_at with offset required')
-    with source.atomic(review, True):
-        review.execute('INSERT OR REPLACE INTO review_chain VALUES (1,?,?,?,?)',
-                       (text(data['reminder_id'], 128), data['revision'], text(data['request_key'], 128), iso(due)))
-        review.execute('DELETE FROM chain_intent WHERE request_key=?', (data['request_key'],))
-    return {'status': 'chain_recorded', 'due_utc': iso(due)}
+                       ('%s@%d' % (text(data['reminder_id'], 128), data['revision']), iso(expires), row['task_id']))
+    return {'status': 'covered', 'task_id': row['task_id'], 'until_utc': iso(expires)}
 
 
 def set_quiet_hours(review, data, at, cfg=None):
@@ -577,6 +532,7 @@ def set_quiet_hours(review, data, at, cfg=None):
 
 
 def status(review, data, at, cfg=None):
+    """Operator/agent summary without private titles."""
     if set(data) - {'task_id'}:
         raise ValueError('optional task_id only')
     if 'task_id' in data:
@@ -587,19 +543,16 @@ def status(review, data, at, cfg=None):
                     (row['task_id'],))]}
     counts = dict(review.execute('''SELECT CASE WHEN closed_status IS NOT NULL THEN 'closed' WHEN opted_out THEN 'opted_out'
         WHEN in_flight_attempt IS NOT NULL THEN 'in_flight' ELSE 'tracked' END,COUNT(*) FROM task_reviews GROUP BY 1''').fetchall())
-    chain_row = review.execute('SELECT reminder_id,revision,due_utc FROM review_chain WHERE id=1').fetchone()
-    return {'status': 'ok', 'counts': counts, 'quiet_hours': quiet_window(review, cfg),
-            'chain': None if chain_row is None else dict(chain_row) | {'current': parse(chain_row['due_utc']) > at},
-            'repair_needed': counts.get('tracked', 0) + counts.get('in_flight', 0) > 0
-                             and (chain_row is None or parse(chain_row['due_utc']) <= at)}
+    last = review.execute('SELECT MAX(at_utc) FROM review_log').fetchone()[0]
+    return {'status': 'ok', 'counts': counts, 'quiet_hours': quiet_window(review, cfg), 'last_review_decision_utc': last}
 
 
 WITH_SOURCE = {'begin_send': begin_send, 'record': record}
-REVIEW_ONLY = {'send_result': send_result, 'responded': responded, 'cover': cover, 'chain': chain,
+REVIEW_ONLY = {'send_result': send_result, 'responded': responded, 'cover': cover,
                'set_quiet_hours': set_quiet_hours, 'status': status}
 
 
-def run(review, src, request, at=None, cfg=None):
+def run(review, src, request, at=None, cfg=None, ledger=None):
     at = at or now_utc()
     if not isinstance(request, dict) or set(request) - {'action', 'args'} or 'action' not in request:
         raise ValueError('{"action":...,"args":{...}} required')
@@ -609,9 +562,9 @@ def run(review, src, request, at=None, cfg=None):
     if action == 'plan':
         if args:
             raise ValueError('plan takes no arguments')
-        return plan(review, src, at, cfg)
+        return plan(review, src, at, cfg, ledger)
     if action in WITH_SOURCE:
-        return WITH_SOURCE[action](review, src, args, at, cfg)
+        return WITH_SOURCE[action](review, src, args, at, cfg, ledger)
     if action in REVIEW_ONLY:
         return REVIEW_ONLY[action](review, args, at, cfg)
     raise ValueError('unsupported action')
@@ -622,7 +575,7 @@ def main():
     p.add_argument('--config', required=True)
     p.add_argument('--init', action='store_true', help='operator: create the empty sidecar once')
     opts = p.parse_args()
-    src = review = None
+    src = review = ledger = None
     try:
         cfg = read_private_json(Path(opts.config))
         if cfg.get('source_schema') != 2 or not cfg.get('source_db') or not cfg.get('task_review_db'):
@@ -636,14 +589,18 @@ def main():
         if opts.init:
             print(json.dumps({'status': 'initialized', 'data_only': True}))
             return 0
+        if cfg.get('database'):  # legacy delivery ledger, read-only, to verify mapped timers
+            ledger = sqlite3.connect(Path(cfg['database']).as_uri() + '?mode=ro', uri=True, timeout=5)
+            ledger.row_factory = sqlite3.Row
+            ledger.execute('PRAGMA query_only=ON')
         request = json.loads(sys.stdin.buffer.read(), object_pairs_hook=pairs)
-        print(json.dumps(run(review, src, request, cfg=cfg), separators=(',', ':'), ensure_ascii=False))
+        print(json.dumps(run(review, src, request, cfg=cfg, ledger=ledger), separators=(',', ':'), ensure_ascii=False))
         return 0
     except (ValueError, KeyError, TypeError, OSError, sqlite3.Error, subprocess.SubprocessError) as e:
         print(json.dumps({'status': 'error', 'error': str(e)[:200], 'data_only': True}))
         return 1
     finally:
-        for db in (src, review):
+        for db in (src, review, ledger):
             if db is not None:
                 db.close()
 

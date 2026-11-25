@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -18,6 +19,7 @@ import task_review as tr  # noqa: E402
 
 ZONE = 'Europe/Prague'
 QUIET = {'start': '21:00', 'end': '08:00', 'basis': 'user_confirmed', 'confirmed_wire_id': 'synthetic-wire-q'}
+PASS = timedelta(minutes=150)
 
 
 def utc(s):
@@ -25,7 +27,7 @@ def utc(s):
 
 
 class User:
-    """One synthetic private user: own dir, source, prefs and sidecar."""
+    """One synthetic private user: own dir, source, prefs, sidecar and (optional) legacy ledger."""
 
     def __init__(self, root, name, zone=ZONE, quiet=QUIET):
         self.dir = Path(root) / name
@@ -40,6 +42,12 @@ class User:
         self.ns = source.meta(self.src, 'namespace')
         self.review = tr.connect_review(self.dir / 'task-review.sqlite', self.ns, initialize=True)
         self.cfg = {'task_review_quiet_hours': quiet} if quiet else {}
+        self.ledger = None
+
+    def close(self):
+        for db in (self.src, self.review, self.ledger):
+            if db is not None:
+                db.close()
 
     def put(self, tid, title='Synthetic task', prereqs=()):
         rev = self.rev(tid)
@@ -58,7 +66,7 @@ class User:
         return 0 if row is None else row[0]
 
     def call(self, action, at, **args):
-        return tr.run(self.review, self.src, {'action': action, 'args': args}, at=at, cfg=self.cfg)
+        return tr.run(self.review, self.src, {'action': action, 'args': args}, at=at, cfg=self.cfg, ledger=self.ledger)
 
     def plan(self, at):
         return self.call('plan', at)
@@ -66,100 +74,111 @@ class User:
     def eligible(self, at):
         return {e['id']: e for e in self.plan(at)['eligible']}
 
-    def send(self, tid, at, attempt, outcome='sent'):
-        e = self.eligible(at)[tid]
-        claim = self.call('begin_send', at, task_id=tid, attempt_id=attempt, source_revision=e['revision'],
-                          claim_token=e['claim_token'])
+    def claim(self, tid, at, attempt, e=None):
+        e = e or self.eligible(at)[tid]
+        return self.call('begin_send', at, task_id=tid, attempt_id=attempt, source_revision=e['revision'],
+                         claim_token=e['claim_token'])
+
+    def send(self, tid, at, attempt):
+        claim = self.claim(tid, at, attempt)
         assert claim['status'] == 'claimed', claim
-        args = {'attempt_id': attempt, 'outcome': outcome}
-        if outcome == 'sent':
-            args['wire_id'] = 'synthetic-wire-' + attempt
-        return self.call('send_result', at, **args)
+        return self.call('send_result', at, attempt_id=attempt, outcome='sent', wire_id='synthetic-wire-' + attempt)
+
+    def task(self, tid, at):
+        return self.call('status', at, task_id=tid)['task']
+
+    def run_pass(self, at, decide):
+        """One periodic pass: decide(e) -> 'send' or 'no_message'. Returns ids sent."""
+        sent, quiet = [], []
+        for e in self.plan(at)['eligible']:
+            if decide(e) == 'send' and e['send_blocked'] is None:
+                try:
+                    self.send(e['id'], at, '%s@%s' % (e['id'], tr.iso(at)))
+                    sent.append(e['id'])
+                    continue
+                except ValueError as exc:  # e.g. window send budget used: truthful deferral
+                    if 'budget' not in str(exc):
+                        raise
+                    quiet.append({'task_id': e['id'], 'attempt_id': 'd%s@%s' % (e['id'], tr.iso(at)), 'outcome': 'deferred'})
+            else:
+                quiet.append({'task_id': e['id'], 'attempt_id': 'r%s@%s' % (e['id'], tr.iso(at)), 'outcome': 'no_message'})
+        if quiet:
+            self.call('record', at, decisions=quiet)
+        return sent
 
 
 class TaskReviewTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         os.chmod(self.tmp.name, 0o700)
-        self._spread = tr.FIRST_SPREAD_HOURS
-        tr.FIRST_SPREAD_HOURS = 1  # deterministic first-review time in most tests
         self.u = User(self.tmp.name, 'alpha')
-        self.t0 = utc('2027-03-01T09:00:00')  # 10:00 Prague, outside quiet hours
+        self.t0 = utc('2027-03-01T09:00:00')  # 10:00 Prague
 
     def tearDown(self):
-        tr.FIRST_SPREAD_HOURS = self._spread
-        self.u.src.close(); self.u.review.close(); self.tmp.cleanup()
+        self.u.close(); self.tmp.cleanup()
 
-    def test_silent_open_task_becomes_eligible_again_without_source_change(self):
+    def test_silent_task_is_reconsidered_every_pass_but_not_re_asked(self):
         u = self.u; u.put('t1')
-        self.assertEqual(u.eligible(self.t0), {})  # first-seen grace
-        at = self.t0 + timedelta(days=1)
-        u.send('t1', at, 'a1')
-        self.assertNotIn('t1', u.eligible(at + timedelta(hours=3)))       # no repeat question in 2-3h
-        self.assertNotIn('t1', u.eligible(at + timedelta(hours=21)))
-        e = u.eligible(at + timedelta(days=1, minutes=1))['t1']           # elapsed time, no hash change
+        self.assertIn('t1', u.eligible(self.t0))            # reviewed on the first pass
+        u.send('t1', self.t0, 'a1')
+        sends, reviewed = [], 0
+        at = self.t0
+        for _ in range(60):                                   # ~6 days of 150-minute passes
+            at += PASS
+            e = u.eligible(at).get('t1')
+            if e is None:
+                continue
+            reviewed += 1
+            if e['send_blocked'] is None:
+                u.send('t1', at, 'a@' + tr.iso(at)); sends.append(at)
+            else:
+                u.call('record', at, task_id='t1', attempt_id='n@' + tr.iso(at), outcome='no_message')
+        self.assertGreater(reviewed, 30)                     # reconsideration cadence ~2-3h
+        gaps = [b - a for a, b in zip([self.t0] + sends, sends)]
+        self.assertTrue(all(g >= timedelta(days=1) for g in gaps), gaps)  # never the same question every 2h
+        self.assertEqual(len(sends), 2)                      # 3 unanswered total, then stop
+
+    def test_exhausted_budget_never_nudges_until_meaningful_change_or_reply(self):
+        u = self.u; u.put('t1')
+        at = self.t0
+        for _ in range(400):                                 # ~6 weeks
+            u.run_pass(at, lambda e: 'send'); at += PASS
+        self.assertEqual(u.task('t1', at)['total_sends'], 3)
+        at = datetime.combine(at.date() + timedelta(days=1), datetime.min.time(), timezone.utc) + timedelta(hours=9)
+        self.assertEqual(u.eligible(at)['t1']['send_blocked'], 'repeat_budget_exhausted_unchanged')
+        u.put('t1', 'Synthetic task with real new information')  # meaningful change re-allows ONE send
+        u.plan(at)
+        at += timedelta(hours=1)
+        e = u.eligible(at)['t1']
         self.assertIsNone(e['send_blocked'])
-        self.assertEqual(e['reason'], 'awaiting_response_backoff')
+        u.send('t1', at, 'after-change')
+        at += timedelta(days=30)
+        e = u.eligible(at)['t1']
+        self.assertEqual(e['send_blocked'], 'repeat_budget_exhausted_unchanged')
+        u.call('responded', at, task_id='t1', wire_id='synthetic-in', incoming_utc=tr.iso(at))
+        self.assertIsNone(u.eligible(at + PASS)['t1']['send_blocked'])
 
-    def test_unchanged_task_no_repeated_questions_and_budget_backoff(self):
+    def test_source_change_and_old_replies_never_replenish_budget(self):
         u = self.u; u.put('t1'); u.plan(self.t0)
-        at = self.t0 + timedelta(days=1)
-        sends = []
-        for i in range(12):  # simulate every 2.5h review for many days
-            now = at + timedelta(hours=2.5 * i * 4)
-            if 't1' in u.eligible(now):
-                e = u.eligible(now)['t1']
-                if e['send_blocked'] is None:
-                    u.send('t1', now, 'b%d' % i); sends.append(now)
-                else:
-                    u.call('record', now, task_id='t1', attempt_id='r%d' % i, outcome='no_message')
-        gaps = [b - a for a, b in zip(sends, sends[1:])]
-        self.assertTrue(all(g >= timedelta(days=1) for g in gaps), gaps)
-        self.assertLessEqual(len(sends), 3)
-        row = u.call('status', at, task_id='t1')['task']
-        self.assertLessEqual(row['unanswered_sends'], 3)
-
-    def test_source_change_does_not_replenish_send_budget(self):
-        u = self.u; u.put('t1'); u.plan(self.t0)
-        at = self.t0 + timedelta(days=1)
-        u.send('t1', at, 'c1')
-        u.put('t1', 'Synthetic task renamed')            # source change
-        u.plan(at + timedelta(hours=1))                     # change observed
-        later = at + timedelta(hours=4, minutes=1)
-        e = u.eligible(later)['t1']                        # review brought forward...
-        self.assertIsNotNone(e['send_blocked'])  # ...but send cooldown untouched
+        u.send('t1', self.t0, 'c1')
+        u.put('t1', 'Synthetic task renamed')               # change brings review forward
+        u.plan(self.t0 + timedelta(minutes=10))
+        later = self.t0 + timedelta(hours=1)
+        e = u.eligible(later)['t1']
+        self.assertTrue(e['send_blocked'].startswith('send_cooldown'))
         with self.assertRaisesRegex(ValueError, 'cooldown'):
-            u.call('begin_send', later, task_id='t1', attempt_id='c2', source_revision=e['revision'], claim_token=e['claim_token'])
-        u.call('responded', later, task_id='t1', wire_id='synthetic-in-1')  # actual engagement resets
-        self.assertEqual(u.call('status', later, task_id='t1')['task']['unanswered_sends'], 0)
-        # a later send, then a REPLAY of the old response must not reset the new budget
+            u.claim('t1', later, 'c2', e)
+        old = tr.iso(self.t0 - timedelta(minutes=5))         # message older than the review message
+        self.assertEqual(u.call('responded', later, task_id='t1', wire_id='old-in', incoming_utc=old)['status'],
+                         'recorded_no_reset')
+        self.assertEqual(u.task('t1', later)['unanswered_sends'], 1)
+        u.call('responded', later, task_id='t1', wire_id='new-in', incoming_utc=tr.iso(later))
+        self.assertEqual(u.task('t1', later)['unanswered_sends'], 0)
         nxt = later + timedelta(days=2)
         u.send('t1', nxt, 'c3')
-        self.assertEqual(u.call('responded', nxt, task_id='t1', wire_id='synthetic-in-1')['status'], 'already_recorded')
-        self.assertEqual(u.call('status', nxt, task_id='t1')['task']['unanswered_sends'], 1)
-
-    def test_exhausted_budget_never_nudges_unchanged_task(self):
-        u = self.u; u.put('t1'); u.plan(self.t0)
-        at = self.t0 + timedelta(days=1)
-        for i in range(3):
-            e = u.eligible(at)['t1']
-            self.assertIsNone(e['send_blocked'], (i, e))
-            u.send('t1', at, 'x%d' % i)
-            at = tr.parse(u.call('status', at, task_id='t1')['task']['next_eligible_utc']) + timedelta(minutes=1)
-        for k in range(10):  # months of unchanged silence: reviewed, never sent
-            now = at + timedelta(days=14 * k)
-            e = u.eligible(now).get('t1')
-            if e:
-                self.assertEqual(e['send_blocked'], 'repeat_budget_exhausted_unchanged')
-                with self.assertRaisesRegex(ValueError, 'exhausted'):
-                    u.call('begin_send', now, task_id='t1', attempt_id='y%d' % k, source_revision=e['revision'],
-                           claim_token=e['claim_token'])
-                u.call('record', now, task_id='t1', attempt_id='n%d' % k, outcome='no_message')
-        self.assertEqual(u.call('status', at, task_id='t1')['task']['total_sends'], 3)
-        u.put('t1', 'Synthetic task with real new information')  # meaningful change re-opens ONE send
-        now = at + timedelta(days=200)
-        e = u.eligible(now)['t1']
-        self.assertIsNone(e['send_blocked'])
+        self.assertEqual(u.call('responded', nxt, task_id='t1', wire_id='new-in', incoming_utc=tr.iso(later))['status'],
+                         'already_recorded')                 # replay never resets the later budget
+        self.assertEqual(u.task('t1', nxt)['unanswered_sends'], 1)
 
     def test_completion_cancellation_and_opt_out_stop_returns(self):
         u = self.u
@@ -167,167 +186,158 @@ class TaskReviewTest(unittest.TestCase):
             u.put(t)
         u.plan(self.t0)
         u.status('done', 'completed'); u.status('gone', 'cancelled')
-        at = self.t0 + timedelta(days=2)
-        e = u.eligible(at)
+        e = u.eligible(self.t0 + PASS)
         self.assertEqual(set(e), {'quiet'})
-        u.call('record', at, task_id='quiet', attempt_id='o1', outcome='opt_out')
-        self.assertEqual(u.eligible(at + timedelta(days=90)), {})
-        self.assertIsNone(u.plan(at + timedelta(days=90))['schedule'])  # nothing to wake for
+        u.call('record', self.t0 + PASS, task_id='quiet', attempt_id='o1', outcome='opt_out')
+        p = u.plan(self.t0 + timedelta(days=90))
+        self.assertEqual((p['eligible'], p['action']), ([], 'end_turn_quietly'))
+        source.run(u.src, 'task_status', {'id': 'done', 'expected_revision': u.rev('done'), 'status': 'open', 'source': 'synthetic'})
+        self.assertIn('done', u.eligible(self.t0 + timedelta(days=90, hours=1)))  # explicit reopen resumes
 
     def test_restart_replay_and_uncertain_send(self):
-        u = self.u; u.put('t1'); u.plan(self.t0)
-        at = self.t0 + timedelta(days=1)
-        e = u.eligible(at)['t1']
-        claim = u.call('begin_send', at, task_id='t1', attempt_id='u1', source_revision=e['revision'], claim_token=e['claim_token'])
-        self.assertTrue(claim['send'])
-        # crash before outcome; restart = reconnect
-        u.review.close(); u.review = tr.connect_review(u.dir / 'task-review.sqlite', u.ns)
-        again = u.call('begin_send', at, task_id='t1', attempt_id='u1', source_revision=e['revision'], claim_token=e['claim_token'])
-        self.assertFalse(again['send'])                                  # replay never re-authorizes
-        self.assertEqual(u.plan(at + timedelta(days=3))['held'][0]['reason'], 'uncertain_send_reconcile_first')
-        u.call('send_result', at, attempt_id='u1', outcome='uncertain')
+        u = self.u; u.put('t1')
+        e = u.eligible(self.t0)['t1']
+        self.assertTrue(u.claim('t1', self.t0, 'u1', e)['send'])
+        u.review.close(); u.review = tr.connect_review(u.dir / 'task-review.sqlite', u.ns)   # crash/restart
+        self.assertFalse(u.claim('t1', self.t0, 'u1', e)['send'])                          # replay: no
+        with self.assertRaisesRegex(ValueError, 'in flight|stale'):
+            u.claim('t1', self.t0, 'u2', e)                                                # new attempt: no
+        later = self.t0 + timedelta(days=3)
+        self.assertEqual(u.plan(later)['held'][0]['reason'], 'uncertain_send_reconcile_first')
+        u.call('send_result', later, attempt_id='u1', outcome='uncertain')
         with self.assertRaises(ValueError):
-            u.call('record', at, task_id='t1', attempt_id='x', outcome='no_message')
-        u.call('send_result', at + timedelta(minutes=5), attempt_id='u1', outcome='sent', wire_id='synthetic-found')
-        row = u.call('status', at, task_id='t1')['task']
+            u.call('record', later, task_id='t1', attempt_id='x', outcome='no_message')
+        u.call('send_result', later, attempt_id='u1', outcome='sent', wire_id='synthetic-found')
+        row = u.task('t1', later)
         self.assertEqual((row['unanswered_sends'], row['total_sends'], row['in_flight_attempt']), (1, 1, None))
-        self.assertEqual(u.call('send_result', at, attempt_id='u1', outcome='sent', wire_id='synthetic-found')['status'],
-                         'already_recorded')
-        self.assertEqual(u.call('status', at, task_id='t1')['task']['total_sends'], 1)
-        with self.assertRaises(ValueError):  # send outcome without claim
-            u.call('send_result', at, attempt_id='never-claimed', outcome='sent', wire_id='w')
+        self.assertEqual(u.call('send_result', later, attempt_id='u1', outcome='sent', wire_id='x')['status'], 'already_recorded')
+        self.assertEqual(u.task('t1', later)['total_sends'], 1)
+        with self.assertRaises(ValueError):
+            u.call('send_result', later, attempt_id='never-claimed', outcome='sent', wire_id='w')
 
-    def test_quiet_hours_unconfirmed_hold_and_downtime_catchup_is_bounded(self):
+    def test_quiet_hours_unconfirmed_hold_and_downtime_is_bounded(self):
         u = self.u
-        for i in range(8):
+        for i in range(30):
             u.put('t%d' % i)
-        u.plan(self.t0)
-        night = utc('2027-03-03T22:30:00')  # 23:30 Prague
+        night = utc('2027-03-03T22:30:00')                   # 23:30 Prague
         p = u.plan(night)
         self.assertTrue(p['quiet_now']); self.assertEqual(p['eligible'], [])
-        self.assertEqual(p['schedule']['args']['local_time'], '2027-03-04T08:00')
-        # downtime: wake comes 4 days late; at most 3 tasks surface, rest spaced
-        late = utc('2027-03-08T10:00:00')
+        late = utc('2027-03-10T10:00:00')                    # first pass after a week of downtime
         p = u.plan(late)
-        self.assertEqual(len(p['eligible']), 8)   # one coalesced review pass
-        for e in p['eligible'][:3]:
-            u.send(e['id'], late, 'd' + e['id'])
-        e = u.eligible(late)
-        self.assertEqual(len(e), 5)
-        first = next(iter(e.values()))
-        with self.assertRaisesRegex(ValueError, 'budget'):
-            u.call('begin_send', late, task_id=first['id'], attempt_id='d-extra', source_revision=first['revision'],
-                   claim_token=first['claim_token'])
-        # unconfirmed quiet hours: planning works, sends are held
+        self.assertEqual(len(p['eligible']), 20); self.assertEqual(p['eligible_next_pass'], 10)
+        sent = u.run_pass(late, lambda e: 'send')
+        self.assertEqual(len(sent), 3)                       # burst bound across all tasks
         v = User(self.tmp.name, 'beta', quiet=None)
-        v.put('x'); v.plan(self.t0)
-        e = v.eligible(self.t0 + timedelta(days=2))['x']
-        self.assertFalse(v.plan(self.t0 + timedelta(days=2))['sends_possible'])
+        v.put('x')
+        e = v.eligible(self.t0)['x']
+        self.assertFalse(v.plan(self.t0)['sends_possible'])
         with self.assertRaisesRegex(ValueError, 'quiet hours not confirmed'):
-            v.call('begin_send', self.t0 + timedelta(days=2), task_id='x', attempt_id='q', source_revision=e['revision'],
-                   claim_token=e['claim_token'])
-        v.src.close(); v.review.close()
+            v.claim('x', self.t0, 'q', e)
+        v.close()
 
-    def test_household_tasks_fail_closed_without_role_guard(self):
-        u = self.u; u.put('hh-item1'); u.plan(self.t0)
-        at = self.t0 + timedelta(days=2)
-        e = u.eligible(at)['hh-item1']
+    def test_concurrent_claims_respect_global_cap(self):
+        u = self.u
+        for i in range(6):
+            u.put('c%d' % i)
+        es = u.plan(self.t0)['eligible']
+        results = []
+
+        def worker(e):
+            db = tr.connect_review(u.dir / 'task-review.sqlite', u.ns)
+            src = source.connect(u.dir / 'source.sqlite3', readonly=True)
+            try:
+                results.append(tr.run(db, src, {'action': 'begin_send', 'args': {
+                    'task_id': e['id'], 'attempt_id': 'k' + e['id'], 'source_revision': e['revision'],
+                    'claim_token': e['claim_token']}}, at=self.t0, cfg=u.cfg)['status'])
+            except (ValueError, sqlite3.OperationalError) as exc:
+                results.append(str(exc))
+            finally:
+                db.close(); src.close()
+        threads = [threading.Thread(target=worker, args=(e,)) for e in es]
+        [t.start() for t in threads]; [t.join() for t in threads]
+        self.assertEqual(results.count('claimed'), 3, results)
+
+    def test_household_tasks_fail_closed_and_recheck_source_after_guard(self):
+        u = self.u; u.put('hh-item1')
+        e = u.eligible(self.t0)['hh-item1']
         self.assertTrue(e['household_guard_required'])
         with self.assertRaisesRegex(ValueError, 'household'):
-            u.call('begin_send', at, task_id='hh-item1', attempt_id='h1', source_revision=e['revision'], claim_token=e['claim_token'])
-        # with a guard helper that refuses (stale/conflicted), still no claim
+            u.claim('hh-item1', self.t0, 'h1', e)
         helper = Path(self.tmp.name) / 'fake_household.py'
         helper.write_text('import sys,json\naction=sys.argv[-1]\n'
                           'print(json.dumps({"status":"bound"} if action=="bind_reminder" else '
                           '{"status":"ok","deliver_allowed":False,"reason":"stale"}))\n')
         u.cfg |= {'household_helper': str(helper), 'household_config': '/nonexistent'}
         with self.assertRaisesRegex(ValueError, 'stale'):
-            u.call('begin_send', at, task_id='hh-item1', attempt_id='h2', source_revision=e['revision'], claim_token=e['claim_token'])
-        self.assertIsNone(u.call('status', at, task_id='hh-item1')['task']['in_flight_attempt'])
+            u.claim('hh-item1', self.t0, 'h2', e)
+        # guard passes but the task is cancelled in source while the guard runs
+        script = ('import sys,json,sqlite3\naction=sys.argv[-1]\n'
+                  'if action=="due_guard":\n'
+                  '    sys.path.insert(0,%r)\n    import source_store as s\n'
+                  '    db=s.connect(__import__("pathlib").Path(%r))\n'
+                  '    r=db.execute("SELECT revision FROM tasks WHERE id=?",("hh-item1",)).fetchone()[0]\n'
+                  '    s.run(db,"task_status",{"id":"hh-item1","expected_revision":r,"status":"cancelled","source":"peer"})\n'
+                  'print(json.dumps({"status":"bound"} if action=="bind_reminder" else '
+                  '{"status":"ok","deliver_allowed":True,"reason":"current","rev":1}))\n') % (
+                      str(HERE.parent / 'scripts'), str(u.dir / 'source.sqlite3'))
+        helper.write_text(script)
+        with self.assertRaisesRegex(ValueError, 'not open|changed'):
+            u.claim('hh-item1', self.t0, 'h3', e)
+        self.assertIsNone(u.task('hh-item1', self.t0)['in_flight_attempt'])
 
-    def test_exact_time_timers_coexist_without_duplicate_channel(self):
-        u = self.u; u.put('t1'); u.put('t2'); u.plan(self.t0)
-        at = self.t0 + timedelta(days=2)
-        due = at + timedelta(days=3)
-        u.call('cover', at, task_id='t1', reminder_id='native-synthetic', due_utc=tr.iso(due))
-        self.assertNotIn('t1', u.eligible(at))
-        self.assertNotIn('t1', u.eligible(due))
-        self.assertIn('t1', u.eligible(due + timedelta(hours=1, minutes=1)))
-        # legacy mapping: active reminder_mappings row holds the task
-        u.src.execute('INSERT INTO source_schedule_operations VALUES (?,?,?,?,?,?,?,?)',
-                      ('op1', 'd', 'task:t2', 1, 'd', '{}', 'mapped', 'r'))
-        u.src.execute('INSERT INTO reminder_mappings VALUES (?,?,?,?,?,?,?)',
-                      ('legacy-1', 'task:t2', 1, 'd', 1, 'active', 'op1'))
-        self.assertEqual([h for h in u.plan(at)['held'] if h['id'] == 't2'][0]['reason'], 'covered_by_existing_timer')
-        # source untouched by review: generation unchanged
-        gen = source.meta(u.src, 'generation'); u.plan(at); self.assertEqual(source.meta(u.src, 'generation'), gen)
+    def test_existing_timers_and_returns_are_reconciled_not_duplicated(self):
+        u = self.u
+        for t in ('native', 'legacy', 'legacy-done', 'rule'):
+            u.put(t)
+        u.plan(self.t0)
+        exp = self.t0 + timedelta(days=3, hours=1)
+        u.call('cover', self.t0, task_id='native', reminder_id='rem-x', revision=2,
+               due_at=tr.iso(self.t0 + timedelta(days=3)), expires_at=tr.iso(exp))
+        # legacy mapping verified against a synthetic delivery ledger
+        u.ledger = sqlite3.connect(':memory:'); u.ledger.row_factory = sqlite3.Row
+        u.ledger.executescript('CREATE TABLE reminders(id TEXT,status TEXT,expires REAL);'
+                               'CREATE TABLE events(reminder_id TEXT,status TEXT);')
+        u.ledger.execute('INSERT INTO reminders VALUES (?,?,?)', ('L1', 'active', (self.t0 + timedelta(days=2)).timestamp()))
+        u.ledger.execute('INSERT INTO reminders VALUES (?,?,?)', ('L2', 'expired', (self.t0 - timedelta(days=2)).timestamp()))
+        for i, (rid, ref) in enumerate((('L1', 'task:legacy'), ('L2', 'task:legacy-done'))):
+            u.src.execute('INSERT INTO source_schedule_operations VALUES (?,?,?,?,?,?,?,?)',
+                          ('op%d' % i, 'd', ref, 1, 'd', '{}', 'mapped', 'r'))
+            u.src.execute('INSERT INTO reminder_mappings VALUES (?,?,?,?,?,?,?)', (rid, ref, 1, 'd', 1, 'active', 'op%d' % i))
+        u.src.execute('CREATE TABLE note_rules(source_ref TEXT,active INT,remaining INT,invalidated_by TEXT,deadline TEXT)')
+        u.src.execute('INSERT INTO note_rules VALUES (?,?,?,?,?)', ('task:rule', 1, 2, None, tr.iso(self.t0 + timedelta(days=1))))
+        at = self.t0 + PASS
+        p = u.plan(at)
+        held = {h['id']: h['reason'] for h in p['held']}
+        self.assertEqual(held, {'native': 'covered_by_native_timer', 'legacy': 'covered_by_legacy_timer',
+                                'rule': 'covered_by_message_return_rule'})
+        self.assertIn('legacy-done', {e['id'] for e in p['eligible']})   # finished timer: not stranded
+        later = self.t0 + timedelta(days=4)
+        self.assertEqual(set(u.eligible(later)), {'native', 'legacy', 'legacy-done', 'rule'})
+        gen = source.meta(u.src, 'generation'); u.plan(later)
+        self.assertEqual(source.meta(u.src, 'generation'), gen)          # source never written
 
     def test_two_private_users_isolated(self):
         a = self.u
         b = User(self.tmp.name, 'beta', zone='America/New_York')
         a.put('shared-id'); b.put('shared-id')
-        a.plan(self.t0); b.plan(self.t0)
-        at = self.t0 + timedelta(days=2)
-        a.send('shared-id', at, 'i1')
-        self.assertIn('shared-id', b.eligible(at + timedelta(hours=8)))  # 10:00 New York
-        self.assertNotIn('shared-id', a.eligible(at + timedelta(hours=8)))
+        a.send('shared-id', self.t0, 'i1')
+        at = self.t0 + timedelta(hours=8)                    # 18:00 Prague, 12:00 New York
+        self.assertTrue(a.eligible(at)['shared-id']['send_blocked'])
+        self.assertIsNone(b.eligible(at)['shared-id']['send_blocked'])
+        self.assertTrue(b.plan(utc('2027-03-01T04:00:00'))['quiet_now'])  # 23:00 in New York, own zone
         b.review.close()
         with self.assertRaisesRegex(ValueError, 'another source'):
             tr.connect_review(a.dir / 'task-review.sqlite', b.ns)
         self.assertEqual(stat.S_IMODE((a.dir / 'task-review.sqlite').stat().st_mode), 0o600)
-        b.src.close()
+        b.review = None; b.close()
 
-    def test_first_reviews_are_staggered(self):
-        tr.FIRST_SPREAD_HOURS = 48
-        u = self.u
-        for i in range(30):
-            u.put('s%d' % i)
+    def test_batch_record_is_atomic(self):
+        u = self.u; u.put('a'); u.put('b')
         u.plan(self.t0)
-        dues = sorted(tr.parse(r[0]) for r in u.review.execute('SELECT next_eligible_utc FROM task_reviews'))
-        self.assertGreaterEqual(dues[0], self.t0 + timedelta(hours=24))
-        self.assertGreater(dues[-1] - dues[0], timedelta(hours=24))
-        # wakes over a week of 'no_message' reviews stay spaced >= 2h and out of quiet hours
-        at, wakes = self.t0, []
-        for _ in range(200):
-            p = u.plan(at)
-            for e in p['eligible']:
-                u.call('record', at, task_id=e['id'], attempt_id='w%s%s' % (e['id'], tr.iso(at)), outcome='no_message')
-            if p['eligible']:
-                wakes.append(at)
-            s = u.plan(at)['schedule']
-            if s is None or s['action'] == 'cancel':
-                break
-            due = tr.parse(s['due_utc'])
-            u.call('chain', at, reminder_id='c', revision=1, request_key=s['args'].get('request_key', 'k'), due_at=s['due_utc'])
-            at = due
-            if at > self.t0 + timedelta(days=7):
-                break
-        gaps = [b - a for a, b in zip(wakes, wakes[1:])]
-        self.assertTrue(all(g >= timedelta(hours=2) for g in gaps), gaps)
-        self.assertLessEqual(len(wakes), 7 * 7)
-        from zoneinfo import ZoneInfo
-        self.assertFalse(any(tr.in_quiet(w, ZoneInfo(ZONE), QUIET) for w in wakes))
-
-    def test_single_chain_and_reschedule(self):
-        u = self.u; u.put('t1')
-        p = u.plan(self.t0)
-        s = p['schedule']
-        # receipt lost after a successful create: later plans repeat the IDENTICAL request
-        again = u.plan(self.t0 + timedelta(hours=7))['schedule']
-        self.assertEqual(again['args'], s['args']); self.assertTrue(again['repeat_of_pending_intent'])
-        self.assertEqual(s['action'], 'create')
-        self.assertEqual(s['args']['late_window_seconds'], 604800)
-        u.call('chain', self.t0, reminder_id='rem-1', revision=1, request_key=s['args']['request_key'],
-               due_at=s['due_utc'])
-        self.assertIsNone(u.plan(self.t0 + timedelta(minutes=1))['schedule'])  # one chain, no duplicate
-        u.put('t2')
-        # after the chain wake, a successor is requested
-        after = tr.parse(s['due_utc']) + timedelta(minutes=1)
-        self.assertEqual(u.plan(after)['schedule']['action'], 'create')
-        # no open tasks: nothing scheduled, current chain cancelled
-        u.status('t1', 'completed'); u.status('t2', 'completed')
-        u.call('chain', after, reminder_id='rem-2', revision=1, request_key='k2', due_at=tr.iso(after + timedelta(hours=5)))
-        self.assertEqual(u.plan(after)['schedule']['action'], 'cancel')
+        with self.assertRaises(ValueError):
+            u.call('record', self.t0, decisions=[{'task_id': 'a', 'attempt_id': 'z1', 'outcome': 'no_message'},
+                                                 {'task_id': 'b', 'attempt_id': 'z2', 'outcome': 'sent'}])
+        self.assertIsNone(u.task('a', self.t0)['last_review_utc'])
 
 
 if __name__ == '__main__':
