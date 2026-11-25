@@ -30,8 +30,10 @@ fixed-interval reminder loop, inbox polling or any other periodic model work.
     prerequisite readiness, which brings the review forward to 30 minutes after
     the change is seen.
 
-  At most 20 tasks are listed per pass, least recently reviewed first; the
-  rest wait for the next pass. During confirmed quiet hours nothing is listed.
+  At most 20 tasks are listed per pass, least recently reviewed first, with
+  titles loaded only for those; the rest wait for the next pass. Held tasks
+  appear only as counts per reason, plus a sample of at most 6 IDs when a
+  review is happening. During confirmed quiet hours nothing is listed.
 - **Accounting** is persisted per task: last review and outcome, last actual
   send (time, wire, outcome), unanswered-send count, total sends, the review
   rationale, opt-out, send claims and counted replies. Restart or replay never

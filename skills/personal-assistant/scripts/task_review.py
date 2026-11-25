@@ -161,7 +161,7 @@ def confirmed_zone(src):
 
 
 def open_tasks(src):
-    rows = src.execute('''SELECT t.id,t.title,t.status,t.revision,t.archived,
+    rows = src.execute('''SELECT t.id,t.status,t.revision,t.archived,
       NOT EXISTS(SELECT 1 FROM prerequisites p JOIN tasks q ON q.id=p.prerequisite_id
                  WHERE p.task_id=t.id AND q.status!='completed') AS ready
       FROM tasks t''').fetchall()
@@ -318,27 +318,35 @@ def plan(review, src, at, cfg=None, ledger=None):
             rows = review.execute('''SELECT * FROM task_reviews WHERE closed_status IS NULL
                 ORDER BY COALESCE(last_review_utc,''),task_id''').fetchall()
             states = [(r, tasks.get(r['task_id'])) + classify(src, ledger, r, tasks.get(r['task_id']), at) for r in rows]
-    eligible, held, waiting = [], [], 0
+    eligible, held, waiting = [], {}, 0
     for r, t, state, detail in states:
         if state == 'eligible':
-            eligible.append({'id': r['task_id'], 'title': t['title'], 'revision': t['revision'],
-                             'ready': bool(t['ready']), 'reason': detail,
-                             'last_review_utc': r['last_review_utc'], 'last_outcome': r['last_outcome'],
-                             'last_send_utc': r['last_send_utc'], 'unanswered_sends': r['unanswered_sends'],
-                             'send_blocked': send_block(r, t, at),
-                             'household_guard_required': r['task_id'].startswith('hh-'),
-                             'claim_token': claim_token(r, t)})
+            eligible.append((r, t, detail))
         elif state == 'held':
-            held.append({'id': r['task_id'], 'reason': detail})
+            held.setdefault(detail, []).append(r['task_id'])
         elif state == 'waiting':
             waiting += 1
     batch = [] if quiet_now else eligible[:MAX_REVIEW_PER_PASS]
-    return {'status': 'ok', 'data_only': True, 'now_utc': iso(at), 'time_zone': zone.key,
-            'quiet_hours': quiet, 'quiet_now': quiet_now,
-            'sends_possible': quiet is not None and not quiet_now,
-            'eligible': batch, 'eligible_next_pass': len(eligible) - len(batch),
-            'held': held, 'waiting': waiting, 'open_tracked': len(rows),
-            'action': 'end_turn_quietly' if not batch else 'review_listed_tasks'}
+    listed = []
+    for r, t, detail in batch:  # titles are loaded only for the bounded listed batch
+        title = src.execute('SELECT title FROM tasks WHERE id=?', (r['task_id'],)).fetchone()['title']
+        listed.append({'id': r['task_id'], 'title': title, 'revision': t['revision'],
+                       'ready': bool(t['ready']), 'reason': detail,
+                       'last_review_utc': r['last_review_utc'], 'last_outcome': r['last_outcome'],
+                       'last_send_utc': r['last_send_utc'], 'unanswered_sends': r['unanswered_sends'],
+                       'send_blocked': send_block(r, t, at),
+                       'household_guard_required': r['task_id'].startswith('hh-'),
+                       'claim_token': claim_token(r, t)})
+    held_summary = {reason: len(ids) for reason, ids in sorted(held.items())}
+    result = {'status': 'ok', 'data_only': True, 'now_utc': iso(at), 'time_zone': zone.key,
+              'quiet_hours': quiet, 'quiet_now': quiet_now,
+              'sends_possible': quiet is not None and not quiet_now,
+              'eligible': listed, 'eligible_next_pass': len(eligible) - len(batch),
+              'held_counts': held_summary, 'waiting': waiting, 'open_tracked': len(rows),
+              'action': 'end_turn_quietly' if not listed else 'review_listed_tasks'}
+    if listed:  # bounded diagnostic sample only when a review is actually happening
+        result['held_sample'] = [{'id': i, 'reason': reason} for reason, ids in sorted(held.items()) for i in ids[:2]][:6]
+    return result
 
 
 def _task_row(review, task_id):

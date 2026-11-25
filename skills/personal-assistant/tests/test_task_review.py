@@ -203,7 +203,7 @@ class TaskReviewTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'in flight|stale'):
             u.claim('t1', self.t0, 'u2', e)                                                # new attempt: no
         later = self.t0 + timedelta(days=3)
-        self.assertEqual(u.plan(later)['held'][0]['reason'], 'uncertain_send_reconcile_first')
+        self.assertEqual(u.plan(later)['held_counts'], {'uncertain_send_reconcile_first': 1})
         u.call('send_result', later, attempt_id='u1', outcome='uncertain')
         with self.assertRaises(ValueError):
             u.call('record', later, task_id='t1', attempt_id='x', outcome='no_message')
@@ -248,6 +248,20 @@ class TaskReviewTest(unittest.TestCase):
         z.call('set_quiet_hours', night, none=True, confirmed_wire_id='syn-q1')
         self.assertTrue(z.plan(night)['sends_possible'])
         w.close(); z.close()
+
+    def test_plan_output_is_bounded(self):
+        u = self.u
+        for i in range(60):
+            u.put('b%02d' % i, 'Synthetic title %d' % i)
+        for i in range(30):
+            u.plan(self.t0)
+        night = utc('2027-03-03T22:30:00')
+        p = u.plan(night)
+        self.assertEqual((p['eligible'], p['action']), ([], 'end_turn_quietly'))
+        self.assertNotIn('held_sample', p)
+        self.assertLess(len(json.dumps(p)), 600)          # quiet pass exposes no backlog
+        p = u.plan(self.t0)
+        self.assertEqual(len(p['eligible']), 20); self.assertEqual(p['eligible_next_pass'], 40)
 
     def test_concurrent_claims_respect_global_cap(self):
         u = self.u
@@ -338,12 +352,12 @@ class TaskReviewTest(unittest.TestCase):
         u.src.execute('INSERT INTO note_rules VALUES (?,?,?,?,?)', ('task:rule', 1, 2, None, tr.iso(self.t0 + timedelta(days=1))))
         at = self.t0 + PASS
         p = u.plan(at)
-        held = {h['id']: h['reason'] for h in p['held']}
-        self.assertEqual(held, {'native': 'covered_by_native_timer', 'legacy': 'covered_by_legacy_timer',
-                                'legacy-uncertain': 'covered_by_legacy_timer_in_delivery',
-                                'legacy-missing': 'covered_by_legacy_timer_unverified',
-                                'journal': 'covered_by_pending_schedule_operation',
-                                'rule': 'covered_by_message_return_rule'})
+        self.assertEqual(p['held_counts'], {'covered_by_native_timer': 1, 'covered_by_legacy_timer': 1,
+                                            'covered_by_legacy_timer_in_delivery': 1,
+                                            'covered_by_legacy_timer_unverified': 1,
+                                            'covered_by_pending_schedule_operation': 1,
+                                            'covered_by_message_return_rule': 1})
+        self.assertLessEqual(len(p['held_sample']), 6)
         self.assertEqual({e['id'] for e in p['eligible']}, {'legacy-done', 'legacy-queued', 'legacy-cancelled'})
         later = self.t0 + timedelta(days=4)
         self.assertEqual(set(u.eligible(later)), {'native', 'legacy', 'legacy-done', 'legacy-queued', 'legacy-cancelled', 'rule'})
