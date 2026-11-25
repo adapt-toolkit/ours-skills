@@ -43,6 +43,13 @@ configured Ours/Telegram tools and destination rules if sending. No outbound
 route may be required to schedule/handle a self-wake. Track actual send outcomes
 separately; do not replay uncertain sends.
 
+## Periodic task review
+
+The configured [task review](task-review.md) is driven by its role loop, not by
+self-reminders; never create a recurring or chained self-reminder for it. When
+a native self-reminder already owns a task's next return, register its actual
+receipt with `task_review.py` `cover` so the review does not duplicate it.
+
 ## Existing installations
 
 Preserve legacy source/admission/send ledgers and outstanding events. Do not bulk
