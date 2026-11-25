@@ -188,8 +188,10 @@ LEDGER_LIVE = """WITH RECURSIVE lineage(id) AS (
 SELECT
  (SELECT MAX(r.expires) FROM reminders r JOIN lineage l ON r.id=l.id WHERE r.status='active') AS active_until,
  EXISTS(SELECT 1 FROM events e JOIN lineage l ON e.reminder_id=l.id
-        WHERE e.delivery_status IN ('sending','uncertain')
-           OR (e.delivery_status IS NULL AND e.status IN ('pending','submitting','queued','uncertain'))) AS in_delivery"""
+        WHERE e.delivery_status IN ('sending','uncertain')) AS transport_uncertain,
+ EXISTS(SELECT 1 FROM events e JOIN lineage l ON e.reminder_id=l.id JOIN reminders r ON r.id=e.reminder_id
+        WHERE e.delivery_status IS NULL AND e.status IN ('pending','submitting','queued','uncertain')
+          AND r.status='active' AND r.revision=e.revision AND r.expires>?) AS admitted_live"""
 
 
 def existing_mechanism(src, ledger, task_id, at):
@@ -206,8 +208,11 @@ def existing_mechanism(src, ledger, task_id, at):
             return 'legacy_timer_unverified', None
         if not all(_has_table(ledger, t) for t in ('reminders', 'events', 'followups')):
             raise ValueError('configured delivery ledger has an unrecognized schema')
-        live = ledger.execute(LEDGER_LIVE, (m['reminder_id'],)).fetchone()
-        if live['in_delivery']:
+        root = ledger.execute('SELECT source_ref FROM reminders WHERE id=?', (m['reminder_id'],)).fetchone()
+        if root is None or (root['source_ref'] is not None and root['source_ref'] != ref):
+            return 'legacy_timer_unverified', None  # missing/mismatched root: never read as "no timer"
+        live = ledger.execute(LEDGER_LIVE, (m['reminder_id'], at.timestamp())).fetchone()
+        if live['transport_uncertain'] or live['admitted_live']:
             return 'legacy_timer_in_delivery', None
         if live['active_until'] is not None and when(live['active_until']) > at:
             return 'legacy_timer', when(live['active_until'])

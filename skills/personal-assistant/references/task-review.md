@@ -108,10 +108,13 @@ so review never creates a second channel for the same purpose:
 
 - legacy source-bound reminders: an active mapping checked against the
   read-only delivery ledger, across the reminder and its follow-ups. It holds
-  while that reminder is active and unexpired, or while any event is still
-  admitted or in delivery (`pending`/`submitting`/`queued`/`uncertain`, or
-  `delivery_status` `sending`/`uncertain`). A naturally finished reminder no
-  longer holds the task;
+  while that reminder is active and unexpired. It also holds while any event
+  has `delivery_status` `sending`/`uncertain`, or is admitted (`pending`/
+  `submitting`/`queued`/`uncertain`) for the CURRENT revision of a reminder
+  that is still active and unexpired. Stale admission rows of an expired,
+  cancelled or revised reminder release the task. A mapped reminder that is
+  missing from the ledger, or bound to another source, holds as unverified;
+  it is never read as "no timer";
 - active message-return rules and contextual return decisions until their
   deadline;
 - a prepared task-trigger reservation;

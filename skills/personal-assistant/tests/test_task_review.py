@@ -302,7 +302,8 @@ class TaskReviewTest(unittest.TestCase):
     def test_existing_timers_and_returns_are_reconciled_not_duplicated(self):
         import reminder_tools
         u = self.u
-        ids = ('native', 'legacy', 'legacy-done', 'legacy-uncertain', 'legacy-queued', 'journal', 'rule')
+        ids = ('native', 'legacy', 'legacy-done', 'legacy-uncertain', 'legacy-queued', 'legacy-cancelled',
+               'legacy-missing', 'journal', 'rule')
         for t in ids:
             u.put(t)
         u.plan(self.t0)
@@ -325,7 +326,12 @@ class TaskReviewTest(unittest.TestCase):
         legacy('L1', 'task:legacy', 'active', future)
         legacy('L2', 'task:legacy-done', 'expired', past, ('expired', 'transport_confirmed'))
         legacy('L3', 'task:legacy-uncertain', 'expired', past, ('queued', 'uncertain'))
-        legacy('L4', 'task:legacy-queued', 'expired', past, ('queued', None))
+        legacy('L4', 'task:legacy-queued', 'expired', past, ('queued', None))       # stale admission only
+        legacy('L5', 'task:legacy-cancelled', 'cancelled', future, ('queued', None))  # cancelled: stale queue
+        u.src.execute('INSERT INTO source_schedule_operations VALUES (?,?,?,?,?,?,?,?)',
+                      ('op-L6', 'd', 'task:legacy-missing', 1, 'd', '{}', 'mapped', 'r'))
+        u.src.execute('INSERT INTO reminder_mappings VALUES (?,?,?,?,?,?,?)',
+                      ('L6', 'task:legacy-missing', 1, 'd', 1, 'active', 'op-L6'))  # root absent from ledger
         u.src.execute('INSERT INTO source_schedule_operations VALUES (?,?,?,?,?,?,?,?)',
                       ('op-j', 'd', 'task:journal', 1, 'd', '{}', 'prepared', None))
         u.src.execute('CREATE TABLE note_rules(source_ref TEXT,active INT,remaining INT,invalidated_by TEXT,deadline TEXT)')
@@ -335,12 +341,12 @@ class TaskReviewTest(unittest.TestCase):
         held = {h['id']: h['reason'] for h in p['held']}
         self.assertEqual(held, {'native': 'covered_by_native_timer', 'legacy': 'covered_by_legacy_timer',
                                 'legacy-uncertain': 'covered_by_legacy_timer_in_delivery',
-                                'legacy-queued': 'covered_by_legacy_timer_in_delivery',
+                                'legacy-missing': 'covered_by_legacy_timer_unverified',
                                 'journal': 'covered_by_pending_schedule_operation',
                                 'rule': 'covered_by_message_return_rule'})
-        self.assertEqual({e['id'] for e in p['eligible']}, {'legacy-done'})   # finished timer: not stranded
+        self.assertEqual({e['id'] for e in p['eligible']}, {'legacy-done', 'legacy-queued', 'legacy-cancelled'})
         later = self.t0 + timedelta(days=4)
-        self.assertEqual(set(u.eligible(later)), {'native', 'legacy', 'legacy-done', 'rule'})
+        self.assertEqual(set(u.eligible(later)), {'native', 'legacy', 'legacy-done', 'legacy-queued', 'legacy-cancelled', 'rule'})
         gen = source.meta(u.src, 'generation'); u.plan(later)
         self.assertEqual(source.meta(u.src, 'generation'), gen)              # source never written
         # unrecognized ledger schema fails closed instead of reading as 'no timer'
