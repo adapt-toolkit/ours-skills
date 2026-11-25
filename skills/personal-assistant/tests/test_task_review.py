@@ -235,6 +235,20 @@ class TaskReviewTest(unittest.TestCase):
             v.claim('x', self.t0, 'q', e)
         v.close()
 
+    def test_confirmed_empty_quiet_hours_differs_from_unset(self):
+        night = utc('2027-03-03T00:30:00')                   # 01:30 Prague
+        w = User(self.tmp.name, 'gamma', quiet={'none': True, 'basis': 'user_confirmed', 'confirmed_wire_id': 'syn-q0'})
+        w.put('x')
+        p = w.plan(night)
+        self.assertEqual((p['quiet_now'], p['sends_possible']), (False, True))
+        self.assertEqual(w.claim('x', night, 'n1', p['eligible'][0])['status'], 'claimed')
+        z = User(self.tmp.name, 'delta', quiet=None)         # unset: held, never a guessed window
+        z.put('x')
+        self.assertFalse(z.plan(night)['sends_possible'])
+        z.call('set_quiet_hours', night, none=True, confirmed_wire_id='syn-q1')
+        self.assertTrue(z.plan(night)['sends_possible'])
+        w.close(); z.close()
+
     def test_concurrent_claims_respect_global_cap(self):
         u = self.u
         for i in range(6):

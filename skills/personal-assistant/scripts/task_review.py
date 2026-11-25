@@ -135,6 +135,10 @@ def quiet_window(review, cfg=None):
     bound = (cfg or {}).get('task_review_quiet_hours')
     if (isinstance(bound, dict) and bound.get('basis') == 'user_confirmed'
             and isinstance(bound.get('confirmed_wire_id'), str) and bound['confirmed_wire_id']):
+        if bound.get('none') is True:  # the user explicitly confirmed having NO quiet hours
+            if set(bound) - {'none', 'basis', 'confirmed_wire_id', 'confirmed_at_utc'}:
+                raise ValueError('confirmed no-quiet-hours takes no window')
+            return {k: bound[k] for k in ('none', 'basis', 'confirmed_wire_id')}
         if _hm(bound['start']) == _hm(bound['end']):
             raise ValueError('invalid configured quiet hours')
         return {k: bound[k] for k in ('start', 'end', 'basis', 'confirmed_wire_id')}
@@ -142,6 +146,8 @@ def quiet_window(review, cfg=None):
 
 
 def in_quiet(at, zone, quiet):
+    if quiet.get('none') is True:
+        return False
     local = at.astimezone(zone).time()
     start, end = _hm(quiet['start']), _hm(quiet['end'])
     return (start <= local < end) if start < end else (local >= start or local < end)
@@ -565,12 +571,16 @@ def cover(review, data, at, cfg=None):
 
 
 def set_quiet_hours(review, data, at, cfg=None):
-    if set(data) != {'start', 'end', 'confirmed_wire_id'}:
-        raise ValueError('start, end (HH:MM) and the user confirmation wire required')
-    if _hm(data['start']) == _hm(data['end']):
-        raise ValueError('empty or full-day quiet window unsupported')
-    value = {'start': data['start'], 'end': data['end'], 'basis': 'user_confirmed',
-             'confirmed_wire_id': text(data['confirmed_wire_id'], 256), 'confirmed_at_utc': iso(at)}
+    if set(data) == {'none', 'confirmed_wire_id'} and data['none'] is True:
+        value = {'none': True, 'basis': 'user_confirmed',
+                 'confirmed_wire_id': text(data['confirmed_wire_id'], 256), 'confirmed_at_utc': iso(at)}
+    else:
+        if set(data) != {'start', 'end', 'confirmed_wire_id'}:
+            raise ValueError('start, end (HH:MM) and the user confirmation wire, or none:true, required')
+        if _hm(data['start']) == _hm(data['end']):
+            raise ValueError('empty or full-day quiet window unsupported; use none:true for a confirmed empty list')
+        value = {'start': data['start'], 'end': data['end'], 'basis': 'user_confirmed',
+                 'confirmed_wire_id': text(data['confirmed_wire_id'], 256), 'confirmed_at_utc': iso(at)}
     with source.atomic(review, True):
         review.execute("INSERT OR REPLACE INTO review_meta VALUES ('quiet_hours',?)", (json.dumps(value),))
     return {'status': 'quiet_hours_set', 'quiet_hours': value}

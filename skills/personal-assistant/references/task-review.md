@@ -95,8 +95,11 @@ fixed-interval reminder loop, inbox polling or any other periodic model work.
   confirmed timezone, never the host's. Record them with `set_quiet_hours`
   (`start`, `end` HH:MM, plus the actual confirmation `wire_id`), or an
   operator records `task_review_quiet_hours` with `basis: "user_confirmed"`
-  in the private host config. Until then reviews may run and conclude
-  `no_message`, but every send is held.
+  in the private host config. A user who explicitly confirmed having NO
+  quiet hours is recorded with `none: true` (plus the confirmation wire). That
+  is distinct from unset, never replaced by a default window, and never
+  treated as unconfirmed. Until confirmation exists, reviews may run and
+  conclude `no_message`, but every send is held.
 
 ## Coexistence with timers and returns
 
